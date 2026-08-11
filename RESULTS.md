@@ -458,3 +458,54 @@ synchronize only when the final image is requested.
 Raw measurements are stored in
 `results/intel-uhd-620-compact-tile-vulkan.csv` and
 `results/amd-radeon-8060s-compact-tile-vulkan.csv`.
+
+### GPU-resident multi-draw composition
+
+The renderer now packs several compact analytic paths into one input, runs one
+subgroup scan/paint dispatch per path, and source-over composites independent
+gradient and solid paints into the same device-local pixel buffer. Compute
+barriers connect the draws inside one command buffer; there is no CPU wait and
+no readback between them. A control submits the same dispatches separately and
+waits after every draw. Both modes match the scalar and all-core CPU references
+exactly, including an odd 70x37 boundary case on both hardware GPUs.
+
+At 1024 square, submission batching is useful once the queue-wait overhead is
+large enough to rise above timing noise. Times below are medians; the CPU
+column uses one persistent all-core worker team for the complete AVX2 scan plus
+source-over batch, and both GPU columns keep the target resident until the
+sequence ends.
+
+| GPU | Draws | All-core CPU | Per-draw GPU waits | Resident GPU batch | Batch vs waits | Resident GPU vs CPU |
+|---|---:|---:|---:|---:|---:|---:|
+| Intel UHD 620 | 2 | 11.712 ms | 2.360 ms | 2.030 ms | 1.16x | 5.77x |
+| Intel UHD 620 | 4 | 24.633 ms | 5.137 ms | 4.055 ms | 1.27x | 6.07x |
+| Intel UHD 620 | 8 | 42.410 ms | 9.079 ms | 7.778 ms | 1.17x | 5.45x |
+| Radeon 8060S | 2 | 0.961 ms | 0.147 ms | 0.204 ms | 0.72x | 4.70x |
+| Radeon 8060S | 4 | 1.768 ms | 0.298 ms | 0.251 ms | 1.19x | 7.03x |
+| Radeon 8060S | 8 | 3.112 ms | 0.575 ms | 0.464 ms | 1.24x | 6.70x |
+
+The two-draw Radeon synchronized median is below the reliable granularity of
+this comparison: the batch median regresses while dispatch-plus-readback
+improves from 0.163 to 0.133 ms. At four and eight draws, batching reduces the
+synchronized median by 16-21% on Radeon and 14-21% on Intel.
+
+At 2048 square with four draws, batching provides a smaller 1.09x synchronized
+gain on each GPU: 15.674 to 14.436 ms on Intel and 0.750 to 0.685 ms on Radeon.
+The resident GPU stage beats the corresponding persistent all-core CPU
+composition by 5.26x and 9.61x. Adding independently measured tile construction
+and packed upload gives diagnostic staged totals of 21.664 ms versus 75.898 ms
+on Intel and 2.359 ms versus 6.589 ms on Radeon, 3.50x and 2.79x end-stage
+advantages respectively.
+
+Device timestamps explain the result. At 1024, batching changes device work by
+less than 5% on both GPUs, so the synchronized advantage is submission
+amortization rather than faster subgroup arithmetic. At 2048, device work also
+remains effectively unchanged. Resident composition matters most when several
+draws would otherwise incur separate waits; pixel count and memory traffic
+still dominate large full-frame draws.
+
+Raw measurements are stored in
+`results/intel-uhd-620-resident-draw-sweep.csv`,
+`results/amd-radeon-8060s-resident-draw-sweep.csv`,
+`results/intel-uhd-620-resident-2048.csv`, and
+`results/amd-radeon-8060s-resident-2048.csv`.

@@ -222,7 +222,7 @@ the synchronized comparison is the fair application-visible answer.
 
 ## Milestone 5: tiled analytic vector renderer
 
-Status: in progress. The dense scalar analytic-cell reference, exact scan
+Status: complete. The dense scalar analytic-cell reference, exact scan
 backends, fill rules, and gradient paint are complete. Edges are now binned
 into 16-pixel vertical bands and accumulated into sparse 64x16 cell tiles.
 Exact equivalence, compact memory, construction time, and temporary dense
@@ -231,8 +231,11 @@ compact tiles directly and propagate row carries through inactive tiles.
 Vulkan now consumes the same compact tile values and lookup directly using the
 serialized, shared-memory, and subgroup kernels. Exact-size input buffers and
 sampled upload timings expose the benefit of eliminating dense materialization
-and transfer. The next step is GPU-resident multi-draw paint and source-over
-composition without a synchronization or readback between paths.
+and transfer. Multiple overlapping paths with independent paints are now packed
+into one upload and source-over composited through subgroup dispatches in one
+command buffer. The target stays device-local between paths, and only the final
+image is optionally read back. A per-draw submit-and-wait control measures the
+synchronization that batching removes.
 
 Integrate the scan into a useful renderer rather than scaling the existing
 brute-force point-in-path loop.

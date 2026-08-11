@@ -127,9 +127,18 @@ kernel. Its input buffers are sized to the actual representation, and upload
 time and byte count are reported separately. All paths preserve exact analytic
 coverage and paint output.
 
-`--shapes N` places independent, non-overlapping hearts in a grid. Start with a
-small sweep because the scalar reference deliberately tests every sample
-against every edge.
+With `--analytic-tiles --shapes N` and `N > 1`, an additional renderer case
+builds `N` deliberately overlapping paths with independent gradient/solid
+paints. The Vulkan path packs every compact draw into one upload, issues all
+subgroup scan/paint dispatches in one command buffer, source-over composites
+into a device-local target, and reads back only the final image. A per-draw
+submit-and-wait sequence is measured as the synchronization control. The CPU
+scalar and all-core AVX2 composition references must match both Vulkan modes
+exactly.
+
+For the original point-in-path baseline, `--shapes N` places independent,
+non-overlapping hearts in a grid. Start with a small sweep because that scalar
+reference deliberately tests every sample against every edge.
 
 The program prints median, best, and p90 timings, speedups relative to scalar
 CPU, synchronized GPU dispatch and dispatch-plus-readback times, and correctness

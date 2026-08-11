@@ -527,7 +527,7 @@ void scanAnalyticTilesScalarRows(
   }
 }
 
-void scanAnalyticTilesAvx2Rows(
+void scanAnalyticTilesAvx2RowsImpl(
   std::span<uint32_t> coverage,
   std::span<uint32_t> pixels,
   const AnalyticTileCells& tiles,
@@ -604,8 +604,22 @@ void scanAnalyticTilesAvx2(
   const AnalyticTileCells& tiles,
   CoverageResolveMode mode) {
   validateAnalyticTileOutputs(coverage, pixels, tiles);
-  scanAnalyticTilesAvx2Rows(
+  scanAnalyticTilesAvx2RowsImpl(
     coverage, pixels, tiles, mode, 0, tiles.height);
+}
+
+void scanAnalyticTilesAvx2Rows(
+  std::span<uint32_t> coverage,
+  std::span<uint32_t> pixels,
+  const AnalyticTileCells& tiles,
+  uint32_t yBegin,
+  uint32_t yEnd,
+  CoverageResolveMode mode) {
+  validateAnalyticTileOutputs(coverage, pixels, tiles);
+  if (yBegin > yEnd || yEnd > tiles.height)
+    throw std::runtime_error("analytic tile scan row range is invalid");
+  scanAnalyticTilesAvx2RowsImpl(
+    coverage, pixels, tiles, mode, yBegin, yEnd);
 }
 
 void scanAnalyticTilesAvx2Threaded(
@@ -617,7 +631,7 @@ void scanAnalyticTilesAvx2Threaded(
   validateAnalyticTileOutputs(coverage, pixels, tiles);
   threadCount = std::max(1u, std::min(threadCount, tiles.height));
   if (threadCount == 1u) {
-    scanAnalyticTilesAvx2Rows(
+    scanAnalyticTilesAvx2RowsImpl(
       coverage, pixels, tiles, mode, 0, tiles.height);
     return;
   }
@@ -629,7 +643,7 @@ void scanAnalyticTilesAvx2Threaded(
     const uint32_t yEnd = uint32_t(
       uint64_t(tiles.height) * (threadId + 1u) / threadCount);
     workers.emplace_back([=, &tiles] {
-      scanAnalyticTilesAvx2Rows(
+      scanAnalyticTilesAvx2RowsImpl(
         coverage, pixels, tiles, mode, yBegin, yEnd);
     });
   }

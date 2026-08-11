@@ -114,6 +114,10 @@ struct VulkanRenderer::Impl {
     uint32_t tileWidth;
     uint32_t tileHeight;
     uint32_t tilesX;
+    uint32_t deltaOffset;
+    uint32_t lookupOffset;
+    uint32_t paintIndex;
+    uint32_t compositeMode;
   };
 
   uint32_t width = 0;
@@ -797,15 +801,18 @@ struct VulkanRenderer::Impl {
     std::span<const uint32_t> tileLookup) {
     const VkDeviceSize deltaBytes = VkDeviceSize(deltas.size_bytes());
     const VkDeviceSize lookupBytes = VkDeviceSize(tileLookup.size_bytes());
-    if (!deltaBytes || deltaBytes > scanDeltaBuffer.size ||
+    if (deltaBytes > scanDeltaBuffer.size ||
         lookupBytes > scanTileLookupBuffer.size)
       vkFail("coverage scan input exceeds allocated buffers");
     const auto start = Clock::now();
     void* mapping = nullptr;
-    vkCheck(vkMapMemory(device, scanDeltaBuffer.memory, 0, deltaBytes, 0, &mapping),
-            "vkMapMemory(scan deltas)");
-    std::memcpy(mapping, deltas.data(), size_t(deltaBytes));
-    vkUnmapMemory(device, scanDeltaBuffer.memory);
+    if (deltaBytes) {
+      vkCheck(vkMapMemory(
+        device, scanDeltaBuffer.memory, 0, deltaBytes, 0, &mapping),
+        "vkMapMemory(scan deltas)");
+      std::memcpy(mapping, deltas.data(), size_t(deltaBytes));
+      vkUnmapMemory(device, scanDeltaBuffer.memory);
+    }
     if (lookupBytes) {
       vkCheck(vkMapMemory(
         device, scanTileLookupBuffer.memory, 0, lookupBytes, 0, &mapping),
@@ -817,20 +824,17 @@ struct VulkanRenderer::Impl {
     return std::chrono::duration<double, std::milli>(stop - start).count();
   }
 
-  void recordCoverageScan(
+  void recordCoverageScans(
     CoverageScanAlgorithm algorithm,
     bool paint,
-    uint32_t coverageScale,
-    CoverageResolveMode resolveMode,
-    uint32_t inputMode,
-    uint32_t tileWidth,
-    uint32_t tileHeight,
-    uint32_t tilesX,
+    std::span<const ScanPushConstants> draws,
     bool copyToHost) {
 
     const uint32_t algorithmIndex = uint32_t(algorithm);
     if (algorithmIndex > uint32_t(CoverageScanAlgorithm::kSubgroup))
       vkFail("unknown coverage scan algorithm");
+    if (draws.empty())
+      vkFail("coverage scan batch is empty");
     vkCheck(vkResetCommandBuffer(commandBuffer, 0), "vkResetCommandBuffer(scan)");
     const VkCommandBufferBeginInfo begin{
       VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr,
@@ -843,17 +847,51 @@ struct VulkanRenderer::Impl {
       scanPipelines[algorithmIndex * 2u + uint32_t(paint)]);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
       scanPipelineLayout, 0, 1, &scanDescriptorSet, 0, nullptr);
-    const ScanPushConstants push{
-      width, height, coverageScale, uint32_t(resolveMode),
-      inputMode, tileWidth, tileHeight, tilesX};
-    vkCmdPushConstants(commandBuffer, scanPipelineLayout,
-      VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     const uint32_t groups = algorithm == CoverageScanAlgorithm::kSerialized
       ? (height + info.subgroupSize - 1u) / info.subgroupSize
       : height;
     if (groups > maxDispatchGroupsX)
       vkFail("coverage scan exceeds maxComputeWorkGroupCount[0]");
-    vkCmdDispatch(commandBuffer, groups, 1, 1);
+    for (size_t drawIndex = 0; drawIndex < draws.size(); ++drawIndex) {
+      const ScanPushConstants& push = draws[drawIndex];
+      if (drawIndex == 0u && push.compositeMode != 0u) {
+        std::array<VkBufferMemoryBarrier, 2> barriers = {{
+          {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr,
+           VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+           VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+           scanCoverageBuffer.handle, 0, scanCoverageBuffer.size},
+          {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr,
+           VK_ACCESS_SHADER_WRITE_BIT,
+           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+           VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+           scanPixelBuffer.handle, 0, scanPixelBuffer.size}
+        }};
+        vkCmdPipelineBarrier(commandBuffer,
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+          0, 0, nullptr, paint ? 2u : 1u, barriers.data(), 0, nullptr);
+      }
+      vkCmdPushConstants(commandBuffer, scanPipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+      vkCmdDispatch(commandBuffer, groups, 1, 1);
+      if (drawIndex + 1u == draws.size())
+        continue;
+      std::array<VkBufferMemoryBarrier, 2> barriers = {{
+        {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr,
+         VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+         scanCoverageBuffer.handle, 0, scanCoverageBuffer.size},
+        {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr,
+         VK_ACCESS_SHADER_WRITE_BIT,
+         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+         scanPixelBuffer.handle, 0, scanPixelBuffer.size}
+      }};
+      vkCmdPipelineBarrier(commandBuffer,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, nullptr, paint ? 2u : 1u, barriers.data(), 0, nullptr);
+    }
     vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool, 1);
 
     if (copyToHost) {
@@ -915,26 +953,27 @@ struct VulkanRenderer::Impl {
     result.uploadMilliseconds.reserve(iterations);
     result.timestampMilliseconds.reserve(iterations);
     result.synchronizedMilliseconds.reserve(iterations);
+    const ScanPushConstants draw{
+      width, height, coverageScale, uint32_t(resolveMode),
+      uint32_t(tiledInput), tileWidth, tileHeight, tilesX,
+      0u, 0u, 0u, 0u};
     for (uint32_t i = 0; i < warmup; ++i)
       uploadScanInput(deltas, tileLookup);
     for (uint32_t i = 0; i < iterations; ++i)
       result.uploadMilliseconds.push_back(uploadScanInput(deltas, tileLookup));
     for (uint32_t i = 0; i < warmup; ++i) {
-      recordCoverageScan(
-        algorithm, paint, coverageScale, resolveMode,
-        uint32_t(tiledInput), tileWidth, tileHeight, tilesX, false);
+      recordCoverageScans(
+        algorithm, paint, std::span<const ScanPushConstants>(&draw, 1u), false);
       submitAndWait();
     }
     for (uint32_t i = 0; i < iterations; ++i) {
-      recordCoverageScan(
-        algorithm, paint, coverageScale, resolveMode,
-        uint32_t(tiledInput), tileWidth, tileHeight, tilesX, false);
+      recordCoverageScans(
+        algorithm, paint, std::span<const ScanPushConstants>(&draw, 1u), false);
       result.synchronizedMilliseconds.push_back(submitAndWait());
       result.timestampMilliseconds.push_back(readTimestampMilliseconds());
     }
-    recordCoverageScan(
-      algorithm, paint, coverageScale, resolveMode,
-      uint32_t(tiledInput), tileWidth, tileHeight, tilesX, true);
+    recordCoverageScans(
+      algorithm, paint, std::span<const ScanPushConstants>(&draw, 1u), true);
     submitAndWait();
 
     result.coverage.resize(pixelCount);
@@ -943,6 +982,123 @@ struct VulkanRenderer::Impl {
       result.pixels.resize(pixelCount);
       std::memcpy(result.pixels.data(), scanPixelMapping, size_t(scanPixelReadback.size));
     }
+    return result;
+  }
+
+  VulkanCoverageScanResult runAnalyticTileBatch(
+    std::span<const AnalyticTileCells> tiles,
+    CoverageResolveMode resolveMode,
+    CoverageScanAlgorithm algorithm,
+    uint32_t warmup,
+    uint32_t iterations,
+    bool synchronizeEachDraw) {
+
+    if (tiles.empty())
+      vkFail("analytic tile batch is empty");
+    if (algorithm == CoverageScanAlgorithm::kSubgroup &&
+        (!subgroupCompute || !subgroupSizeControl ||
+         (subgroupFeatures & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) == 0 ||
+         (subgroupFeatures & VK_SUBGROUP_FEATURE_BALLOT_BIT) == 0 ||
+         (subgroupFeatures & VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT) == 0))
+      vkFail("required subgroup scan/shuffle operations are unavailable in compute shaders");
+
+    size_t deltaCount = 0;
+    size_t lookupCount = 0;
+    for (const AnalyticTileCells& draw : tiles) {
+      const size_t cellsPerTile = size_t(draw.tileWidth) * draw.tileHeight;
+      if (draw.width != width || draw.height != height ||
+          !draw.tileWidth || !draw.tileHeight || !draw.tilesX ||
+          draw.values.size() != draw.tileIds.size() * cellsPerTile ||
+          draw.tileLookup.size() != size_t(draw.tilesX) * draw.tilesY)
+        vkFail("invalid compact analytic tile batch input");
+      if (draw.values.size() > std::numeric_limits<uint32_t>::max() - deltaCount ||
+          draw.tileLookup.size() > std::numeric_limits<uint32_t>::max() - lookupCount)
+        vkFail("analytic tile batch exceeds 32-bit shader offsets");
+      deltaCount += draw.values.size();
+      lookupCount += draw.tileLookup.size();
+    }
+
+    std::vector<int32_t> packedDeltas;
+    std::vector<uint32_t> packedLookup;
+    std::vector<ScanPushConstants> draws;
+    packedDeltas.reserve(deltaCount);
+    packedLookup.reserve(lookupCount);
+    draws.reserve(tiles.size());
+    for (size_t drawIndex = 0; drawIndex < tiles.size(); ++drawIndex) {
+      const AnalyticTileCells& draw = tiles[drawIndex];
+      draws.push_back(ScanPushConstants{
+        width, height, draw.scale, uint32_t(resolveMode),
+        1u, draw.tileWidth, draw.tileHeight, draw.tilesX,
+        uint32_t(packedDeltas.size()), uint32_t(packedLookup.size()),
+        uint32_t(drawIndex), drawIndex == 0u ? 0u : 1u});
+      packedDeltas.insert(
+        packedDeltas.end(), draw.values.begin(), draw.values.end());
+      packedLookup.insert(
+        packedLookup.end(), draw.tileLookup.begin(), draw.tileLookup.end());
+    }
+
+    initializeScanResources(
+      VkDeviceSize(packedDeltas.size() * sizeof(int32_t)),
+      VkDeviceSize(packedLookup.size() * sizeof(uint32_t)));
+    VulkanCoverageScanResult result;
+    result.inputBytes = uint64_t(packedDeltas.size()) * sizeof(int32_t) +
+      uint64_t(packedLookup.size()) * sizeof(uint32_t);
+    result.uploadMilliseconds.reserve(iterations);
+    result.timestampMilliseconds.reserve(iterations);
+    result.synchronizedMilliseconds.reserve(iterations);
+    result.readbackMilliseconds.reserve(iterations);
+    for (uint32_t i = 0; i < warmup; ++i)
+      uploadScanInput(packedDeltas, packedLookup);
+    for (uint32_t i = 0; i < iterations; ++i)
+      result.uploadMilliseconds.push_back(
+        uploadScanInput(packedDeltas, packedLookup));
+    const auto execute = [&](bool copyToHost, bool collectTimestamp) {
+      double synchronizedMilliseconds = 0.0;
+      double timestampMilliseconds = 0.0;
+      if (!synchronizeEachDraw) {
+        recordCoverageScans(algorithm, true, draws, copyToHost);
+        synchronizedMilliseconds = submitAndWait();
+        if (collectTimestamp)
+          timestampMilliseconds = readTimestampMilliseconds();
+      }
+      else {
+        for (size_t drawIndex = 0; drawIndex < draws.size(); ++drawIndex) {
+          const bool copyDraw = copyToHost && drawIndex + 1u == draws.size();
+          recordCoverageScans(
+            algorithm, true,
+            std::span<const ScanPushConstants>(&draws[drawIndex], 1u), copyDraw);
+          synchronizedMilliseconds += submitAndWait();
+          if (collectTimestamp)
+            timestampMilliseconds += readTimestampMilliseconds();
+        }
+      }
+      return std::array<double, 2>{
+        synchronizedMilliseconds, timestampMilliseconds};
+    };
+    for (uint32_t i = 0; i < warmup; ++i) {
+      execute(false, false);
+    }
+    for (uint32_t i = 0; i < iterations; ++i) {
+      const auto timing = execute(false, true);
+      result.synchronizedMilliseconds.push_back(timing[0]);
+      result.timestampMilliseconds.push_back(timing[1]);
+    }
+    for (uint32_t i = 0; i < warmup; ++i) {
+      execute(true, false);
+    }
+    for (uint32_t i = 0; i < iterations; ++i) {
+      const auto timing = execute(true, false);
+      result.readbackMilliseconds.push_back(timing[0]);
+    }
+
+    result.coverage.resize(pixelCount);
+    result.pixels.resize(pixelCount);
+    std::memcpy(
+      result.coverage.data(), scanCoverageMapping,
+      size_t(scanCoverageReadback.size));
+    std::memcpy(
+      result.pixels.data(), scanPixelMapping,
+      size_t(scanPixelReadback.size));
     return result;
   }
 };
@@ -999,6 +1155,26 @@ VulkanCoverageScanResult VulkanRenderer::runAnalyticTileScan(
     tiles.values, tiles.tileLookup, tiles.scale, resolveMode,
     tiles.tileWidth, tiles.tileHeight, tiles.tilesX,
     algorithm, paint, warmup, iterations);
+}
+
+VulkanCoverageScanResult VulkanRenderer::runAnalyticTileBatch(
+  std::span<const AnalyticTileCells> draws,
+  CoverageResolveMode resolveMode,
+  CoverageScanAlgorithm algorithm,
+  uint32_t warmup,
+  uint32_t iterations) {
+  return impl_->runAnalyticTileBatch(
+    draws, resolveMode, algorithm, warmup, iterations, false);
+}
+
+VulkanCoverageScanResult VulkanRenderer::runAnalyticTileSequence(
+  std::span<const AnalyticTileCells> draws,
+  CoverageResolveMode resolveMode,
+  CoverageScanAlgorithm algorithm,
+  uint32_t warmup,
+  uint32_t iterations) {
+  return impl_->runAnalyticTileBatch(
+    draws, resolveMode, algorithm, warmup, iterations, true);
 }
 
 } // namespace gpusimd

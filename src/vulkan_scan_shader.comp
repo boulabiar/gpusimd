@@ -16,7 +16,7 @@ layout(set = 0, binding = 1, std430) writeonly buffer CoverageBuffer {
   uint coverage[];
 };
 
-layout(set = 0, binding = 2, std430) writeonly buffer PixelBuffer {
+layout(set = 0, binding = 2, std430) buffer PixelBuffer {
   uint pixels[];
 };
 
@@ -33,24 +33,61 @@ layout(push_constant) uniform PushConstants {
   uint tileWidth;
   uint tileHeight;
   uint tilesX;
+  uint deltaOffset;
+  uint lookupOffset;
+  uint paintIndex;
+  uint compositeMode;
 } pc;
 
 shared int scanValues[64];
 shared int blockCarry;
 
-uint shadePixel(uint x, uint y, uint cover) {
-  uint alpha = (cover * 255u + pc.coverageScale / 2u) / pc.coverageScale;
+uint checkerPixel(uint x, uint y) {
   uint tile = ((x >> 5u) ^ (y >> 5u)) & 1u;
-  uint bgR = tile != 0u ? 30u : 48u;
-  uint bgG = tile != 0u ? 34u : 52u;
-  uint bgB = tile != 0u ? 44u : 64u;
-  uint srcR = 48u + (x * 190u) / (pc.width > 1u ? pc.width - 1u : 1u);
-  uint srcG = 32u + (y * 172u) / (pc.height > 1u ? pc.height - 1u : 1u);
-  uint srcB = 210u;
+  uint r = tile != 0u ? 30u : 48u;
+  uint g = tile != 0u ? 34u : 52u;
+  uint b = tile != 0u ? 44u : 64u;
+  return r | (g << 8u) | (b << 16u) | 0xFF000000u;
+}
+
+uint paintSourcePixel(uint x, uint y) {
+  uint r;
+  uint g;
+  uint b;
+  switch (pc.paintIndex % 3u) {
+    case 0u:
+      r = 48u + (x * 190u) / (pc.width > 1u ? pc.width - 1u : 1u);
+      g = 32u + (y * 172u) / (pc.height > 1u ? pc.height - 1u : 1u);
+      b = 210u;
+      break;
+    case 1u:
+      r = 238u;
+      g = 82u;
+      b = 66u;
+      break;
+    default:
+      r = 42u + (y * 100u) / (pc.height > 1u ? pc.height - 1u : 1u);
+      g = 190u;
+      b = 48u + (x * 174u) / (pc.width > 1u ? pc.width - 1u : 1u);
+      break;
+  }
+  return r | (g << 8u) | (b << 16u) | 0xFF000000u;
+}
+
+uint shadePixel(uint index, uint x, uint y, uint cover) {
+  uint alpha = (cover * 255u + pc.coverageScale / 2u) / pc.coverageScale;
+  uint source = paintSourcePixel(x, y);
+  uint destination = pc.compositeMode == 0u ? checkerPixel(x, y) : pixels[index];
+  uint srcR = source & 255u;
+  uint srcG = (source >> 8u) & 255u;
+  uint srcB = (source >> 16u) & 255u;
+  uint dstR = destination & 255u;
+  uint dstG = (destination >> 8u) & 255u;
+  uint dstB = (destination >> 16u) & 255u;
   uint invAlpha = 255u - alpha;
-  uint outR = (srcR * alpha + bgR * invAlpha + 127u) / 255u;
-  uint outG = (srcG * alpha + bgG * invAlpha + 127u) / 255u;
-  uint outB = (srcB * alpha + bgB * invAlpha + 127u) / 255u;
+  uint outR = (srcR * alpha + dstR * invAlpha + 127u) / 255u;
+  uint outG = (srcG * alpha + dstG * invAlpha + 127u) / 255u;
+  uint outB = (srcB * alpha + dstB * invAlpha + 127u) / 255u;
   return outR | (outG << 8u) | (outB << 16u) | 0xFF000000u;
 }
 
@@ -71,21 +108,22 @@ void writeResult(uint index, uint x, uint y, int value) {
   uint cover = resolveCoverage(value);
   coverage[index] = cover;
   if (PAINT != 0u)
-    pixels[index] = shadePixel(x, y, cover);
+    pixels[index] = shadePixel(index, x, y, cover);
 }
 
 int loadDelta(uint index, uint x, uint y) {
   if (pc.inputMode == 0u)
-    return deltas[index];
+    return deltas[pc.deltaOffset + index];
   uint tileX = x / pc.tileWidth;
   uint tileY = y / pc.tileHeight;
-  uint compactIndex = tileLookup[tileY * pc.tilesX + tileX];
+  uint compactIndex = tileLookup[pc.lookupOffset + tileY * pc.tilesX + tileX];
   if (compactIndex == 0xFFFFFFFFu)
     return 0;
   uint localX = x - tileX * pc.tileWidth;
   uint localY = y - tileY * pc.tileHeight;
   uint cellsPerTile = pc.tileWidth * pc.tileHeight;
-  return deltas[compactIndex * cellsPerTile + localY * pc.tileWidth + localX];
+  return deltas[pc.deltaOffset + compactIndex * cellsPerTile +
+                localY * pc.tileWidth + localX];
 }
 
 void serializedScan() {

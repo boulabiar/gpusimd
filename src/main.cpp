@@ -240,7 +240,7 @@ Options parseOptions(int argc, char** argv) {
         << "  --shapes N         independent heart shapes in the scene (default 1)\n"
         << "  --coverage-scan    benchmark fixed-point coverage prefix scans\n"
         << "  --analytic-cells   use Blend2D-style analytic cell deltas (even-odd)\n"
-        << "  --analytic-tiles   use sparse 64x16 analytic tiles, then materialize\n"
+        << "  --analytic-tiles   use sparse 64x16 analytic tiles directly\n"
         << "  --scan-y-samples N vertical samples for coverage-delta input (default 64)\n"
         << "  --sweep-sizes LIST comma-separated square image sizes\n"
         << "  --sweep-threads LIST comma-separated CPU worker counts\n"
@@ -439,6 +439,25 @@ std::vector<Edge> makeScene(
   return edges;
 }
 
+std::vector<std::vector<Edge>> makeOverlappingCompositionPaths(
+  uint32_t width,
+  uint32_t height,
+  uint32_t curveSegments,
+  float flatness,
+  uint32_t shapeCount) {
+
+  std::vector<std::vector<Edge>> paths(shapeCount);
+  const float extent = float(std::min(width, height));
+  const float scale = 0.28f * extent;
+  for (uint32_t i = 0; i < shapeCount; ++i) {
+    const float angle = 2.0f * float(M_PI) * float(i) / float(shapeCount);
+    const float cx = 0.50f * float(width) + std::cos(angle) * 0.12f * extent;
+    const float cy = 0.43f * float(height) + std::sin(angle) * 0.05f * extent;
+    addHeart(paths[i], cx, cy, scale, curveSegments, flatness);
+  }
+  return paths;
+}
+
 template<class Function>
 void parallelRows(uint32_t height, uint32_t threadCount, Function&& function) {
   threadCount = std::min(threadCount, height);
@@ -503,6 +522,50 @@ void renderAvx2(
       for (; x < width; ++x) {
         const float hits = gpusimd::coverageProgram<gpusimd::ScalarOps>(float(x), float(y), edges, aaGrid);
         output[size_t(y) * width + x] = gpusimd::shadePixel(x, y, width, height, uint32_t(hits), sampleCount);
+      }
+    }
+  });
+}
+
+void renderAnalyticTileBatchCpu(
+  std::span<uint32_t> output,
+  std::span<uint32_t> coverageScratch,
+  std::span<const gpusimd::AnalyticTileCells> draws,
+  uint32_t threadCount,
+  gpusimd::CoverageResolveMode resolveMode) {
+
+  if (draws.empty())
+    fail("analytic tile composition batch is empty");
+  const uint32_t width = draws.front().width;
+  const uint32_t height = draws.front().height;
+  if (output.size() != size_t(width) * height ||
+      coverageScratch.size() != output.size())
+    fail("analytic tile composition buffer size mismatch");
+
+  for (const gpusimd::AnalyticTileCells& draw : draws)
+    if (draw.width != width || draw.height != height)
+      fail("analytic tile composition dimensions do not match");
+  parallelRows(height, threadCount, [&](uint32_t y0, uint32_t y1) {
+    for (uint32_t y = y0; y < y1; ++y)
+      for (uint32_t x = 0; x < width; ++x)
+        output[size_t(y) * width + x] = gpusimd::checkerPixel(x, y);
+    for (size_t drawIndex = 0; drawIndex < draws.size(); ++drawIndex) {
+      const gpusimd::AnalyticTileCells& draw = draws[drawIndex];
+      if (threadCount == 1u)
+        gpusimd::scanAnalyticTilesScalar(
+          coverageScratch, {}, draw, resolveMode);
+      else
+        gpusimd::scanAnalyticTilesAvx2Rows(
+          coverageScratch, {}, draw, y0, y1, resolveMode);
+      for (uint32_t y = y0; y < y1; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+          const size_t index = size_t(y) * width + x;
+          output[index] = gpusimd::paintSourceOverPixel(
+            output[index],
+            gpusimd::paintSourcePixel(
+              x, y, width, height, uint32_t(drawIndex)),
+            coverageScratch[index], draw.scale);
+        }
       }
     }
   });
@@ -1177,6 +1240,13 @@ int main(int argc, char** argv) {
       std::vector<uint32_t> scanPixelsReference;
       Timing scalarScanTiming;
       Timing scalarScanPaintTiming;
+      std::vector<gpusimd::AnalyticTileCells> residentDrawTiles;
+      std::vector<uint32_t> residentCoverageReference;
+      std::vector<uint32_t> residentPixelsReference;
+      Timing residentConstructionTiming;
+      Timing residentScalarTiming;
+      Timing residentThreadedTiming;
+      Comparison residentThreadedComparison;
       const gpusimd::CoverageResolveMode scanResolveMode = options.analyticCells
         ? gpusimd::CoverageResolveMode::kEvenOdd
         : gpusimd::CoverageResolveMode::kDirect;
@@ -1330,6 +1400,40 @@ int main(int argc, char** argv) {
               directTileThreadedCoverage, directTileThreadedPixels,
               analyticTiles, config.threads, scanResolveMode);
           });
+          if (config.shapeCount > 1u) {
+            const std::vector<std::vector<Edge>> compositionPaths =
+              makeOverlappingCompositionPaths(
+                config.width, config.height, config.curveSegments,
+                config.flatness, config.shapeCount);
+            residentDrawTiles.resize(compositionPaths.size());
+            residentConstructionTiming = benchmark(
+              options.warmup, options.iterations, [&] {
+                for (size_t i = 0; i < compositionPaths.size(); ++i) {
+                  residentDrawTiles[i] = gpusimd::buildTiledAnalyticCells(
+                    config.width, config.height, compositionPaths[i]);
+                }
+              });
+            residentCoverageReference.resize(pixelCount);
+            residentPixelsReference.resize(pixelCount);
+            residentScalarTiming = benchmark(
+              options.warmup, options.iterations, [&] {
+                renderAnalyticTileBatchCpu(
+                  residentPixelsReference, residentCoverageReference,
+                  residentDrawTiles, 1u, scanResolveMode);
+              });
+            std::vector<uint32_t> residentThreadedCoverage(pixelCount);
+            std::vector<uint32_t> residentThreadedPixels(pixelCount);
+            residentThreadedTiming = benchmark(
+              options.warmup, options.iterations, [&] {
+                renderAnalyticTileBatchCpu(
+                  residentThreadedPixels, residentThreadedCoverage,
+                  residentDrawTiles, config.threads, scanResolveMode);
+              });
+            residentThreadedComparison = compareImages(
+              residentPixelsReference, residentThreadedPixels);
+            if (residentThreadedComparison.differingPixels)
+              fail("threaded analytic tile composition correctness check failed");
+          }
         }
         const Comparison avxCoverageComparison = compareCoverage(
           scanCoverageReference, avxCoverage);
@@ -1427,6 +1531,18 @@ int main(int argc, char** argv) {
               directTileAvxPaintComparison.differingPixels ||
               directTileThreadedPaintComparison.differingPixels)
             fail("direct analytic tile scan correctness check failed");
+          if (!residentDrawTiles.empty()) {
+            std::cout << "\nCPU source-over composition of "
+                      << residentDrawTiles.size()
+                      << " overlapping compact-tile draws; median construction "
+                      << residentConstructionTiming.medianMs << " ms:\n";
+            printTiming("CPU scalar resident batch", residentScalarTiming,
+                        residentScalarTiming.medianMs);
+            printTiming("CPU threaded resident batch", residentThreadedTiming,
+                        residentScalarTiming.medianMs);
+            printComparison("CPU threaded composition",
+                            residentThreadedComparison, pixelCount);
+          }
         }
 
         if (options.analyticCells) {
@@ -1487,6 +1603,25 @@ int main(int argc, char** argv) {
             directTileScalarPaintTiming.medianMs /
               directTileThreadedPaintTiming.medianMs,
             directTileThreadedPaintComparison, {}});
+          if (!residentDrawTiles.empty()) {
+            rows.push_back(ResultRow{
+              config, uint32_t(edges.size()), 1u,
+              "cpu_resident_batch_construction", "cpu",
+              "resident_analytic_batch_construction", residentConstructionTiming,
+              1.0, {}, {}});
+            rows.push_back(ResultRow{
+              config, uint32_t(edges.size()), 1u,
+              "cpu_resident_batch_scalar", "cpu",
+              "resident_analytic_batch", residentScalarTiming,
+              1.0, {}, {}});
+            rows.push_back(ResultRow{
+              config, uint32_t(edges.size()),
+              std::min(config.threads, config.height),
+              "cpu_resident_batch_threaded", "cpu",
+              "resident_analytic_batch", residentThreadedTiming,
+              residentScalarTiming.medianMs / residentThreadedTiming.medianMs,
+              residentThreadedComparison, {}});
+          }
         }
 
         rows.push_back(ResultRow{
@@ -1531,6 +1666,9 @@ int main(int argc, char** argv) {
             : options.analyticCells
               ? "analytic_cells_cpu.ppm" : "coverage_scan_cpu.ppm"),
             config.width, config.height, scanPixelsReference);
+        if (!residentPixelsReference.empty())
+          writePpm(imageDirectory / "resident_batch_cpu.ppm",
+                   config.width, config.height, residentPixelsReference);
       }
 
       if (options.gpu && options.openGl) {
@@ -1777,6 +1915,100 @@ int main(int argc, char** argv) {
                              "gpu_tile_scan_shared", "compact shared", true);
             runScanAlgorithm(gpusimd::CoverageScanAlgorithm::kSubgroup,
                              "gpu_tile_scan_subgroup", "compact subgroup", true);
+            if (!residentDrawTiles.empty()) {
+              auto sequence = renderer.runAnalyticTileSequence(
+                residentDrawTiles, scanResolveMode,
+                gpusimd::CoverageScanAlgorithm::kSubgroup,
+                options.warmup, options.iterations);
+              auto batch = renderer.runAnalyticTileBatch(
+                residentDrawTiles, scanResolveMode,
+                gpusimd::CoverageScanAlgorithm::kSubgroup,
+                options.warmup, options.iterations);
+              const uint64_t batchInputBytes = batch.inputBytes;
+              const Timing sequenceTimestamp = summarizeSamples(
+                std::move(sequence.timestampMilliseconds));
+              const Timing sequenceSync = summarizeSamples(
+                std::move(sequence.synchronizedMilliseconds));
+              const Timing sequenceReadback = summarizeSamples(
+                std::move(sequence.readbackMilliseconds));
+              const Timing batchUpload = summarizeSamples(
+                std::move(batch.uploadMilliseconds));
+              const Timing batchTimestamp = summarizeSamples(
+                std::move(batch.timestampMilliseconds));
+              const Timing batchSync = summarizeSamples(
+                std::move(batch.synchronizedMilliseconds));
+              const Timing batchReadback = summarizeSamples(
+                std::move(batch.readbackMilliseconds));
+              const Comparison batchCoverageComparison = compareCoverage(
+                residentCoverageReference, batch.coverage);
+              const Comparison batchPixelComparison = compareImages(
+                residentPixelsReference, batch.pixels);
+              const Comparison sequenceCoverageComparison = compareCoverage(
+                residentCoverageReference, sequence.coverage);
+              const Comparison sequencePixelComparison = compareImages(
+                residentPixelsReference, sequence.pixels);
+
+              std::cout << "\nVulkan resident source-over batch of "
+                        << residentDrawTiles.size() << " overlapping draws:\n"
+                        << "  packed input upload: " << batchInputBytes
+                        << " bytes in " << batchUpload.medianMs << " ms\n";
+              printTiming("VK per-draw waits timestamp", sequenceTimestamp,
+                          residentScalarTiming.medianMs);
+              printTiming("VK per-draw waits + sync", sequenceSync,
+                          residentScalarTiming.medianMs);
+              printTiming("VK per-draw waits + readback", sequenceReadback,
+                          residentScalarTiming.medianMs);
+              printTiming("VK resident batch timestamp", batchTimestamp,
+                          sequenceTimestamp.medianMs);
+              printTiming("VK resident batch + sync", batchSync,
+                          sequenceSync.medianMs);
+              printTiming("VK resident batch + readback", batchReadback,
+                          sequenceReadback.medianMs);
+              printComparison("per-draw wait composition",
+                              sequencePixelComparison, pixelCount);
+              printCoverageComparison("resident batch final draw",
+                                      batchCoverageComparison, pixelCount);
+              printComparison("resident batch composition",
+                              batchPixelComparison, pixelCount);
+              if (sequenceCoverageComparison.differingPixels ||
+                  sequencePixelComparison.differingPixels ||
+                  batchCoverageComparison.differingPixels ||
+                  batchPixelComparison.differingPixels)
+                fail("Vulkan resident analytic batch correctness failed");
+
+              const auto addBatchRow = [&](const char* backend,
+                                           const char* scope,
+                                           const Timing& timing,
+                                           const Comparison& comparison) {
+                rows.push_back(ResultRow{
+                  config, uint32_t(edges.size()), 0u, backend, "vulkan", scope,
+                  timing, residentScalarTiming.medianMs / timing.medianMs,
+                  comparison, gpuInfo});
+              };
+              addBatchRow("gpu_per_draw_wait_subgroup",
+                          "resident_analytic_sequence_device_timestamp",
+                          sequenceTimestamp, sequencePixelComparison);
+              addBatchRow("gpu_per_draw_wait_subgroup",
+                          "resident_analytic_sequence_synchronized",
+                          sequenceSync, sequencePixelComparison);
+              addBatchRow("gpu_per_draw_wait_subgroup",
+                          "resident_analytic_sequence_plus_readback",
+                          sequenceReadback, sequencePixelComparison);
+              addBatchRow("gpu_resident_batch_subgroup",
+                          "resident_analytic_batch_upload", batchUpload, {});
+              addBatchRow("gpu_resident_batch_subgroup",
+                          "resident_analytic_batch_device_timestamp",
+                          batchTimestamp, batchPixelComparison);
+              addBatchRow("gpu_resident_batch_subgroup",
+                          "resident_analytic_batch_synchronized",
+                          batchSync, batchPixelComparison);
+              addBatchRow("gpu_resident_batch_subgroup",
+                          "resident_analytic_batch_plus_readback",
+                          batchReadback, batchPixelComparison);
+              if (options.writeImages)
+                writePpm(imageDirectory / "vulkan_resident_batch.ppm",
+                         config.width, config.height, batch.pixels);
+            }
           }
         }
       }

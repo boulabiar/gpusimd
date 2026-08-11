@@ -69,6 +69,14 @@ void scanAnalyticTilesAvx2(
   const AnalyticTileCells& tiles,
   CoverageResolveMode mode = CoverageResolveMode::kEvenOdd);
 
+void scanAnalyticTilesAvx2Rows(
+  std::span<uint32_t> coverage,
+  std::span<uint32_t> pixels,
+  const AnalyticTileCells& tiles,
+  uint32_t yBegin,
+  uint32_t yEnd,
+  CoverageResolveMode mode = CoverageResolveMode::kEvenOdd);
+
 void scanAnalyticTilesAvx2Threaded(
   std::span<uint32_t> coverage,
   std::span<uint32_t> pixels,

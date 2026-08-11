@@ -41,6 +41,7 @@ struct VulkanCoverageScanResult {
   std::vector<uint32_t> pixels;
   std::vector<double> timestampMilliseconds;
   std::vector<double> synchronizedMilliseconds;
+  std::vector<double> readbackMilliseconds;
   std::vector<double> uploadMilliseconds;
   uint64_t inputBytes = 0;
 };
@@ -72,6 +73,18 @@ public:
     CoverageResolveMode resolveMode,
     CoverageScanAlgorithm algorithm,
     bool paint,
+    uint32_t warmup,
+    uint32_t iterations);
+  VulkanCoverageScanResult runAnalyticTileBatch(
+    std::span<const AnalyticTileCells> draws,
+    CoverageResolveMode resolveMode,
+    CoverageScanAlgorithm algorithm,
+    uint32_t warmup,
+    uint32_t iterations);
+  VulkanCoverageScanResult runAnalyticTileSequence(
+    std::span<const AnalyticTileCells> draws,
+    CoverageResolveMode resolveMode,
+    CoverageScanAlgorithm algorithm,
     uint32_t warmup,
     uint32_t iterations);
 

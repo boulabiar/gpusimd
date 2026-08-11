@@ -104,7 +104,7 @@ if(BUILD_TESTING)
     NAME analytic_tiles_cpu_correctness_smoke
     COMMAND gpusimd_vector_bench
       --width 70 --height 37 --aa 2 --iterations 1 --threads 2
-      --curve-segments 4 --analytic-tiles --no-gpu --no-images
+      --curve-segments 4 --shapes 2 --analytic-tiles --no-gpu --no-images
   )
   add_test(
     NAME csv_schema_smoke

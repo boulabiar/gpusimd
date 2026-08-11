@@ -90,6 +90,64 @@ inline typename Ops::F coverageProgram(
   return hits;
 }
 
+inline uint32_t checkerPixel(uint32_t x, uint32_t y) noexcept {
+  const uint32_t tile = ((x >> 5u) ^ (y >> 5u)) & 1u;
+  const uint32_t r = tile ? 30u : 48u;
+  const uint32_t g = tile ? 34u : 52u;
+  const uint32_t b = tile ? 44u : 64u;
+  return r | (g << 8u) | (b << 16u) | 0xFF000000u;
+}
+
+inline uint32_t paintSourcePixel(
+  uint32_t x,
+  uint32_t y,
+  uint32_t width,
+  uint32_t height,
+  uint32_t paintIndex) noexcept {
+
+  uint32_t r = 0;
+  uint32_t g = 0;
+  uint32_t b = 0;
+  switch (paintIndex % 3u) {
+    case 0:
+      r = 48u + (x * 190u) / (width > 1u ? width - 1u : 1u);
+      g = 32u + (y * 172u) / (height > 1u ? height - 1u : 1u);
+      b = 210u;
+      break;
+    case 1:
+      r = 238u;
+      g = 82u;
+      b = 66u;
+      break;
+    default:
+      r = 42u + (y * 100u) / (height > 1u ? height - 1u : 1u);
+      g = 190u;
+      b = 48u + (x * 174u) / (width > 1u ? width - 1u : 1u);
+      break;
+  }
+  return r | (g << 8u) | (b << 16u) | 0xFF000000u;
+}
+
+inline uint32_t paintSourceOverPixel(
+  uint32_t destination,
+  uint32_t source,
+  uint32_t hits,
+  uint32_t sampleCount) noexcept {
+
+  const uint32_t alpha = (hits * 255u + sampleCount / 2u) / sampleCount;
+  const uint32_t invAlpha = 255u - alpha;
+  const uint32_t srcR = source & 255u;
+  const uint32_t srcG = (source >> 8u) & 255u;
+  const uint32_t srcB = (source >> 16u) & 255u;
+  const uint32_t dstR = destination & 255u;
+  const uint32_t dstG = (destination >> 8u) & 255u;
+  const uint32_t dstB = (destination >> 16u) & 255u;
+  const uint32_t outR = (srcR * alpha + dstR * invAlpha + 127u) / 255u;
+  const uint32_t outG = (srcG * alpha + dstG * invAlpha + 127u) / 255u;
+  const uint32_t outB = (srcB * alpha + dstB * invAlpha + 127u) / 255u;
+  return outR | (outG << 8u) | (outB << 16u) | 0xFF000000u;
+}
+
 inline uint32_t shadePixel(
   uint32_t x,
   uint32_t y,
@@ -98,23 +156,9 @@ inline uint32_t shadePixel(
   uint32_t hits,
   uint32_t sampleCount) noexcept {
 
-  const uint32_t alpha = (hits * 255u + sampleCount / 2u) / sampleCount;
-
-  const uint32_t tile = ((x >> 5u) ^ (y >> 5u)) & 1u;
-  const uint32_t bgR = tile ? 30u : 48u;
-  const uint32_t bgG = tile ? 34u : 52u;
-  const uint32_t bgB = tile ? 44u : 64u;
-
-  const uint32_t srcR = 48u + (x * 190u) / (width > 1u ? width - 1u : 1u);
-  const uint32_t srcG = 32u + (y * 172u) / (height > 1u ? height - 1u : 1u);
-  const uint32_t srcB = 210u;
-  const uint32_t invAlpha = 255u - alpha;
-
-  const uint32_t outR = (srcR * alpha + bgR * invAlpha + 127u) / 255u;
-  const uint32_t outG = (srcG * alpha + bgG * invAlpha + 127u) / 255u;
-  const uint32_t outB = (srcB * alpha + bgB * invAlpha + 127u) / 255u;
-
-  return outR | (outG << 8u) | (outB << 16u) | 0xFF000000u;
+  return paintSourceOverPixel(
+    checkerPixel(x, y), paintSourcePixel(x, y, width, height, 0u),
+    hits, sampleCount);
 }
 
 } // namespace gpusimd
