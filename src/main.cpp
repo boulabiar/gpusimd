@@ -74,6 +74,7 @@ struct Options {
   bool requireHardwareGpu = false;
   bool coverageScan = false;
   bool analyticCells = false;
+  bool tiledAnalyticCells = false;
 };
 
 struct Configuration {
@@ -220,6 +221,11 @@ Options parseOptions(int argc, char** argv) {
       options.coverageScan = true;
       options.analyticCells = true;
     }
+    else if (arg == "--analytic-tiles") {
+      options.coverageScan = true;
+      options.analyticCells = true;
+      options.tiledAnalyticCells = true;
+    }
     else if (arg == "--help") {
       std::cout
         << "Usage: gpusimd_vector_bench [options]\n"
@@ -234,6 +240,7 @@ Options parseOptions(int argc, char** argv) {
         << "  --shapes N         independent heart shapes in the scene (default 1)\n"
         << "  --coverage-scan    benchmark fixed-point coverage prefix scans\n"
         << "  --analytic-cells   use Blend2D-style analytic cell deltas (even-odd)\n"
+        << "  --analytic-tiles   use sparse 64x16 analytic tiles, then materialize\n"
         << "  --scan-y-samples N vertical samples for coverage-delta input (default 64)\n"
         << "  --sweep-sizes LIST comma-separated square image sizes\n"
         << "  --sweep-threads LIST comma-separated CPU worker counts\n"
@@ -1212,15 +1219,31 @@ int main(int argc, char** argv) {
                                scalarTiming.medianMs / threadedTiming.medianMs, threadedComparison, {}});
 
       if (options.coverageScan) {
-        const Timing inputBuildTiming = benchmark(
-          options.warmup, options.iterations, [&] {
-            coverageDeltas = options.analyticCells
-              ? gpusimd::buildAnalyticCoverageDeltas(
-                  config.width, config.height, edges)
-              : gpusimd::buildCoverageDeltas(
-                  config.width, config.height, edges,
-                  options.scanVerticalSamples, 256);
-          });
+        Timing inputBuildTiming;
+        Timing materializeTiming;
+        gpusimd::AnalyticTileCells analyticTiles;
+        if (options.tiledAnalyticCells) {
+          inputBuildTiming = benchmark(
+            options.warmup, options.iterations, [&] {
+              analyticTiles = gpusimd::buildTiledAnalyticCells(
+                config.width, config.height, edges);
+            });
+          materializeTiming = benchmark(
+            options.warmup, options.iterations, [&] {
+              coverageDeltas = gpusimd::materializeAnalyticTiles(analyticTiles);
+            });
+        }
+        else {
+          inputBuildTiming = benchmark(
+            options.warmup, options.iterations, [&] {
+              coverageDeltas = options.analyticCells
+                ? gpusimd::buildAnalyticCoverageDeltas(
+                    config.width, config.height, edges)
+                : gpusimd::buildCoverageDeltas(
+                    config.width, config.height, edges,
+                    options.scanVerticalSamples, 256);
+            });
+        }
         scanCoverageReference.resize(pixelCount);
         scanPixelsReference.resize(pixelCount);
         std::vector<uint32_t> avxCoverage(pixelCount);
@@ -1268,7 +1291,9 @@ int main(int argc, char** argv) {
           scanCoverageReference, threadedScanCoverage);
         const Comparison threadedScanPaintComparison = compareImages(
           scanPixelsReference, threadedScanPixels);
-        std::cout << (options.analyticCells
+        std::cout << (options.tiledAnalyticCells
+          ? "\nSparse 64x16 analytic tile input: 8-bit subpixels, even-odd fill, scale "
+          : options.analyticCells
           ? "\nBlend2D-style analytic cell input: 8-bit subpixels, even-odd fill, scale "
           : "\nCoverage-delta input: " +
             std::to_string(coverageDeltas.verticalSamples) +
@@ -1278,6 +1303,18 @@ int main(int argc, char** argv) {
                   << coverageDeltas.scale
                   << "; median construction " << std::fixed << std::setprecision(3)
                   << inputBuildTiming.medianMs << " ms\n";
+        if (options.tiledAnalyticCells) {
+          const uint64_t compactBytes =
+            uint64_t(analyticTiles.values.size()) * sizeof(int32_t) +
+            uint64_t(analyticTiles.tileIds.size()) * sizeof(uint32_t);
+          const uint64_t denseBytes = uint64_t(pixelCount) * sizeof(int32_t);
+          std::cout << "  " << analyticTiles.tileIds.size() << "/"
+                    << uint64_t(analyticTiles.tilesX) * analyticTiles.tilesY
+                    << " tiles active, " << analyticTiles.binnedEdgeReferences
+                    << " binned edge references, " << compactBytes
+                    << "/" << denseBytes << " compact/dense bytes; materialized in "
+                    << materializeTiming.medianMs << " ms\n";
+        }
         printTiming("CPU scalar coverage scan", scalarScanTiming, scalarScanTiming.medianMs);
         printTiming("CPU AVX2 coverage scan", avxScanTiming, scalarScanTiming.medianMs);
         printTiming("CPU AVX2 threaded scan", threadedScanTiming, scalarScanTiming.medianMs);
@@ -1300,18 +1337,28 @@ int main(int argc, char** argv) {
           printComparison("analytic vs supersample", supersampleComparison, pixelCount);
         }
 
-        const char* scanScope = options.analyticCells
-          ? "analytic_coverage_scan" : "coverage_scan";
-        const char* scanPaintScope = options.analyticCells
-          ? "analytic_coverage_scan_paint" : "coverage_scan_paint";
+        const char* scanScope = options.tiledAnalyticCells
+          ? "tiled_analytic_coverage_scan"
+          : options.analyticCells ? "analytic_coverage_scan" : "coverage_scan";
+        const char* scanPaintScope = options.tiledAnalyticCells
+          ? "tiled_analytic_coverage_scan_paint"
+          : options.analyticCells
+            ? "analytic_coverage_scan_paint" : "coverage_scan_paint";
 
         rows.push_back(ResultRow{
           config, uint32_t(edges.size()), 1u,
-          options.analyticCells ? "cpu_analytic_cells" : "cpu_sampled_deltas",
+          options.tiledAnalyticCells ? "cpu_analytic_tiles"
+            : options.analyticCells ? "cpu_analytic_cells" : "cpu_sampled_deltas",
           "cpu",
-          options.analyticCells
+          options.tiledAnalyticCells ? "analytic_tile_construction"
+            : options.analyticCells
             ? "analytic_cell_construction" : "coverage_delta_construction",
           inputBuildTiming, 1.0, {}, {}});
+        if (options.tiledAnalyticCells) {
+          rows.push_back(ResultRow{
+            config, uint32_t(edges.size()), 1u, "cpu_analytic_tiles", "cpu",
+            "analytic_tile_materialization", materializeTiming, 1.0, {}, {}});
+        }
 
         rows.push_back(ResultRow{
           config, uint32_t(edges.size()), 1u, "cpu_scan_scalar", "cpu",
@@ -1350,8 +1397,10 @@ int main(int argc, char** argv) {
         writePpm(imageDirectory / "scalar.ppm", config.width, config.height, scalarPixels);
         writePpm(imageDirectory / "avx2.ppm", config.width, config.height, simdPixels);
         if (options.coverageScan)
-          writePpm(imageDirectory / (options.analyticCells
-            ? "analytic_cells_cpu.ppm" : "coverage_scan_cpu.ppm"),
+          writePpm(imageDirectory / (options.tiledAnalyticCells
+            ? "analytic_tiles_cpu.ppm"
+            : options.analyticCells
+              ? "analytic_cells_cpu.ppm" : "coverage_scan_cpu.ppm"),
             config.width, config.height, scanPixelsReference);
       }
 
@@ -1543,8 +1592,9 @@ int main(int argc, char** argv) {
                 config, uint32_t(edges.size()), 0u, backend, "vulkan", scope,
                 timing, baseline / timing.medianMs, comparison, gpuInfo});
             };
-            const std::string scopePrefix = options.analyticCells
-              ? "analytic_coverage_scan" : "coverage_scan";
+            const std::string scopePrefix = options.tiledAnalyticCells
+              ? "tiled_analytic_coverage_scan"
+              : options.analyticCells ? "analytic_coverage_scan" : "coverage_scan";
             addScanRow((scopePrefix + "_device_timestamp").c_str(), scanTimestamp,
                        scalarScanTiming.medianMs, scanComparison);
             addScanRow((scopePrefix + "_synchronized").c_str(), scanSync,
@@ -1557,7 +1607,10 @@ int main(int argc, char** argv) {
             if (options.writeImages &&
                 algorithm == gpusimd::CoverageScanAlgorithm::kSubgroup) {
               writePpm(imageDirectory / (options.analyticCells
-                ? "vulkan_analytic_subgroup.ppm" : "vulkan_subgroup_scan.ppm"),
+                ? (options.tiledAnalyticCells
+                    ? "vulkan_analytic_tiles_subgroup.ppm"
+                    : "vulkan_analytic_subgroup.ppm")
+                : "vulkan_subgroup_scan.ppm"),
                        config.width, config.height, paint.pixels);
             }
           };

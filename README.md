@@ -68,6 +68,8 @@ Useful options:
   --width 1024 --height 1024 --curve-segments 12 --no-images
 ./build/gpusimd_vector_bench --analytic-cells --vulkan --no-opengl \
   --width 1024 --height 1024 --curve-segments 12 --no-images
+./build/gpusimd_vector_bench --analytic-tiles --vulkan --no-opengl \
+  --width 2048 --height 2048 --curve-segments 12 --no-images
 ./build/gpusimd_vector_bench --help
 ```
 
@@ -112,6 +114,14 @@ invariants, while the heart command currently selects even-odd to preserve its
 hole. This remains a dense scanline reference: tile binning, sparse tile-local
 storage, GPU cell accumulation, and multi-draw composition belong to the next
 renderer milestone.
+
+`--analytic-tiles` exercises the next intermediate representation. Edges are
+binned into 16-pixel-high bands, combined cover/area cells accumulate in sparse
+64x16 tiles, and only touched tiles are allocated. The program reports active
+tiles, binned edge references, compact versus dense bytes, tile construction,
+and dense materialization separately. Materialization currently feeds the
+existing dense CPU/Vulkan scans and is intentionally visible as a temporary
+compatibility cost; a later resident tile scan will remove it.
 
 `--shapes N` places independent, non-overlapping hearts in a grid. Start with a
 small sweep because the scalar reference deliberately tests every sample

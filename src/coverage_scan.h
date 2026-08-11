@@ -22,6 +22,19 @@ struct CoverageDeltas {
   uint32_t horizontalUnits = 0;
 };
 
+struct AnalyticTileCells {
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t tileWidth = 64;
+  uint32_t tileHeight = 16;
+  uint32_t tilesX = 0;
+  uint32_t tilesY = 0;
+  uint32_t scale = 0;
+  uint64_t binnedEdgeReferences = 0;
+  std::vector<uint32_t> tileIds;
+  std::vector<int32_t> values;
+};
+
 CoverageDeltas buildCoverageDeltas(
   uint32_t width,
   uint32_t height,
@@ -33,6 +46,15 @@ CoverageDeltas buildAnalyticCoverageDeltas(
   uint32_t width,
   uint32_t height,
   std::span<const Edge> edges);
+
+AnalyticTileCells buildTiledAnalyticCells(
+  uint32_t width,
+  uint32_t height,
+  std::span<const Edge> edges,
+  uint32_t tileWidth = 64,
+  uint32_t tileHeight = 16);
+
+CoverageDeltas materializeAnalyticTiles(const AnalyticTileCells& tiles);
 
 uint32_t resolveCoverageValue(
   int32_t accumulated,

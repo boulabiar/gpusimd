@@ -153,6 +153,101 @@ void scanCoverageAvx2Rows(
   }
 }
 
+constexpr int64_t kAnalyticSubpixelScale = 256;
+constexpr int64_t kAnalyticAreaScale = kAnalyticSubpixelScale * 2;
+constexpr uint32_t kAnalyticCoverageScale =
+  uint32_t(kAnalyticSubpixelScale * kAnalyticAreaScale);
+
+template<class AddCell>
+void rasterizeAnalyticEdge(
+  const Edge& edge,
+  uint32_t yBegin,
+  uint32_t yEnd,
+  AddCell&& addCell) {
+
+  int64_t x0 = std::llround(double(edge.x0) * kAnalyticSubpixelScale);
+  int64_t y0 = std::llround(double(edge.y0) * kAnalyticSubpixelScale);
+  int64_t y1 = std::llround(double(edge.y1) * kAnalyticSubpixelScale);
+  int64_t x1 = std::llround(
+    (double(edge.x0) + double(edge.y1 - edge.y0) * double(edge.dxOverDy)) *
+    kAnalyticSubpixelScale);
+  if (y0 == y1)
+    return;
+
+  int64_t sign = 1;
+  if (y0 > y1) {
+    std::swap(x0, x1);
+    std::swap(y0, y1);
+    sign = -1;
+  }
+
+  const int64_t clippedY0 = std::max<int64_t>(
+    y0, int64_t(yBegin) * kAnalyticSubpixelScale);
+  const int64_t clippedY1 = std::min<int64_t>(
+    y1, int64_t(yEnd) * kAnalyticSubpixelScale);
+  if (clippedY0 >= clippedY1)
+    return;
+
+  const double inverseDy = 1.0 / double(y1 - y0);
+  const auto xAtY = [&](int64_t y) {
+    return double(x0) + double(y - y0) * double(x1 - x0) * inverseDy;
+  };
+
+  const uint32_t rowBegin = uint32_t(clippedY0 / kAnalyticSubpixelScale);
+  const uint32_t rowEnd = uint32_t(
+    (clippedY1 - 1) / kAnalyticSubpixelScale);
+  for (uint32_t y = rowBegin; y <= rowEnd; ++y) {
+    const int64_t segmentY0 = std::max<int64_t>(
+      clippedY0, int64_t(y) * kAnalyticSubpixelScale);
+    const int64_t segmentY1 = std::min<int64_t>(
+      clippedY1, int64_t(y + 1u) * kAnalyticSubpixelScale);
+    const double segmentX0 = xAtY(segmentY0);
+    const double segmentX1 = xAtY(segmentY1);
+
+    std::vector<double> cuts{0.0, 1.0};
+    if (segmentX0 != segmentX1) {
+      const double minX = std::min(segmentX0, segmentX1);
+      const double maxX = std::max(segmentX0, segmentX1);
+      int64_t boundary =
+        (int64_t(std::floor(minX / double(kAnalyticSubpixelScale))) + 1) *
+        kAnalyticSubpixelScale;
+      for (; double(boundary) < maxX; boundary += kAnalyticSubpixelScale) {
+        const double t = (double(boundary) - segmentX0) /
+                         (segmentX1 - segmentX0);
+        if (t > 0.0 && t < 1.0)
+          cuts.push_back(t);
+      }
+      std::sort(cuts.begin(), cuts.end());
+    }
+
+    for (size_t i = 0; i + 1u < cuts.size(); ++i) {
+      const double t0 = cuts[i];
+      const double t1 = cuts[i + 1u];
+      const double xa = segmentX0 + (segmentX1 - segmentX0) * t0;
+      const double xb = segmentX0 + (segmentX1 - segmentX0) * t1;
+      const int64_t ya = std::llround(
+        double(segmentY0) + double(segmentY1 - segmentY0) * t0);
+      const int64_t yb = std::llround(
+        double(segmentY0) + double(segmentY1 - segmentY0) * t1);
+      const int64_t deltaY = yb - ya;
+      if (!deltaY)
+        continue;
+
+      const int64_t cellX = int64_t(std::floor(
+        ((xa + xb) * 0.5) / double(kAnalyticSubpixelScale)));
+      const int64_t cellOrigin = cellX * kAnalyticSubpixelScale;
+      const int64_t fx0 = std::clamp<int64_t>(
+        std::llround(xa) - cellOrigin, 0, kAnalyticSubpixelScale);
+      const int64_t fx1 = std::clamp<int64_t>(
+        std::llround(xb) - cellOrigin, 0, kAnalyticSubpixelScale);
+      const int64_t cover = sign * deltaY;
+      const int64_t area = cover * (fx0 + fx1);
+      addCell(y, cellX, cover * kAnalyticAreaScale - area);
+      addCell(y, cellX + 1, area);
+    }
+  }
+}
+
 } // namespace
 
 CoverageDeltas buildCoverageDeltas(
@@ -213,12 +308,10 @@ CoverageDeltas buildAnalyticCoverageDeltas(
   if (!width || !height)
     throw std::runtime_error("analytic coverage dimensions must be non-zero");
 
-  constexpr int64_t kSubpixelScale = 256;
-  constexpr int64_t kAreaScale = kSubpixelScale * 2;
   CoverageDeltas result;
   result.values.resize(size_t(width) * height);
-  result.scale = uint32_t(kSubpixelScale * kAreaScale);
-  result.horizontalUnits = uint32_t(kSubpixelScale);
+  result.scale = kAnalyticCoverageScale;
+  result.horizontalUnits = uint32_t(kAnalyticSubpixelScale);
   std::vector<int64_t> cells(result.values.size());
 
   const auto addCell = [&](uint32_t y, int64_t x, int64_t value) {
@@ -228,94 +321,133 @@ CoverageDeltas buildAnalyticCoverageDeltas(
     cells[size_t(y) * width + visibleX] += value;
   };
 
-  for (const Edge& edge : edges) {
-    int64_t x0 = std::llround(double(edge.x0) * kSubpixelScale);
-    int64_t y0 = std::llround(double(edge.y0) * kSubpixelScale);
-    int64_t y1 = std::llround(double(edge.y1) * kSubpixelScale);
-    int64_t x1 = std::llround(
-      (double(edge.x0) + double(edge.y1 - edge.y0) * double(edge.dxOverDy)) *
-      kSubpixelScale);
-    if (y0 == y1)
-      continue;
-
-    int64_t sign = 1;
-    if (y0 > y1) {
-      std::swap(x0, x1);
-      std::swap(y0, y1);
-      sign = -1;
-    }
-
-    const int64_t clippedY0 = std::max<int64_t>(y0, 0);
-    const int64_t clippedY1 = std::min<int64_t>(
-      y1, int64_t(height) * kSubpixelScale);
-    if (clippedY0 >= clippedY1)
-      continue;
-
-    const double inverseDy = 1.0 / double(y1 - y0);
-    const auto xAtY = [&](int64_t y) {
-      return double(x0) + double(y - y0) * double(x1 - x0) * inverseDy;
-    };
-
-    const uint32_t rowBegin = uint32_t(clippedY0 / kSubpixelScale);
-    const uint32_t rowEnd = uint32_t(
-      (clippedY1 - 1) / kSubpixelScale);
-    for (uint32_t y = rowBegin; y <= rowEnd; ++y) {
-      const int64_t segmentY0 = std::max<int64_t>(
-        clippedY0, int64_t(y) * kSubpixelScale);
-      const int64_t segmentY1 = std::min<int64_t>(
-        clippedY1, int64_t(y + 1u) * kSubpixelScale);
-      const double segmentX0 = xAtY(segmentY0);
-      const double segmentX1 = xAtY(segmentY1);
-
-      std::vector<double> cuts{0.0, 1.0};
-      if (segmentX0 != segmentX1) {
-        const double minX = std::min(segmentX0, segmentX1);
-        const double maxX = std::max(segmentX0, segmentX1);
-        int64_t boundary =
-          (int64_t(std::floor(minX / double(kSubpixelScale))) + 1) *
-          kSubpixelScale;
-        for (; double(boundary) < maxX; boundary += kSubpixelScale) {
-          const double t = (double(boundary) - segmentX0) /
-                           (segmentX1 - segmentX0);
-          if (t > 0.0 && t < 1.0)
-            cuts.push_back(t);
-        }
-        std::sort(cuts.begin(), cuts.end());
-      }
-
-      for (size_t i = 0; i + 1u < cuts.size(); ++i) {
-        const double t0 = cuts[i];
-        const double t1 = cuts[i + 1u];
-        const double xa = segmentX0 + (segmentX1 - segmentX0) * t0;
-        const double xb = segmentX0 + (segmentX1 - segmentX0) * t1;
-        const int64_t ya = std::llround(
-          double(segmentY0) + double(segmentY1 - segmentY0) * t0);
-        const int64_t yb = std::llround(
-          double(segmentY0) + double(segmentY1 - segmentY0) * t1);
-        const int64_t deltaY = yb - ya;
-        if (!deltaY)
-          continue;
-
-        const int64_t cellX = int64_t(std::floor(
-          ((xa + xb) * 0.5) / double(kSubpixelScale)));
-        const int64_t cellOrigin = cellX * kSubpixelScale;
-        const int64_t fx0 = std::clamp<int64_t>(
-          std::llround(xa) - cellOrigin, 0, kSubpixelScale);
-        const int64_t fx1 = std::clamp<int64_t>(
-          std::llround(xb) - cellOrigin, 0, kSubpixelScale);
-        const int64_t cover = sign * deltaY;
-        const int64_t area = cover * (fx0 + fx1);
-        addCell(y, cellX, cover * kAreaScale - area);
-        addCell(y, cellX + 1, area);
-      }
-    }
-  }
+  for (const Edge& edge : edges)
+    rasterizeAnalyticEdge(edge, 0, height, addCell);
 
   for (size_t i = 0; i < cells.size(); ++i) {
     if (cells[i] < std::numeric_limits<int32_t>::min() ||
         cells[i] > std::numeric_limits<int32_t>::max())
       throw std::runtime_error("analytic coverage cell exceeds int32 range");
     result.values[i] = int32_t(cells[i]);
+  }
+  return result;
+}
+
+AnalyticTileCells buildTiledAnalyticCells(
+  uint32_t width,
+  uint32_t height,
+  std::span<const Edge> edges,
+  uint32_t tileWidth,
+  uint32_t tileHeight) {
+
+  if (!width || !height || !tileWidth || !tileHeight)
+    throw std::runtime_error("analytic tile dimensions must be non-zero");
+
+  AnalyticTileCells result;
+  result.width = width;
+  result.height = height;
+  result.tileWidth = tileWidth;
+  result.tileHeight = tileHeight;
+  result.tilesX = (width + tileWidth - 1u) / tileWidth;
+  result.tilesY = (height + tileHeight - 1u) / tileHeight;
+  result.scale = kAnalyticCoverageScale;
+
+  std::vector<std::vector<uint32_t>> edgeBins(result.tilesY);
+  if (edges.size() > std::numeric_limits<uint32_t>::max())
+    throw std::runtime_error("too many edges for analytic tile bins");
+  const int64_t imageY1 = int64_t(height) * kAnalyticSubpixelScale;
+  const int64_t bandHeight = int64_t(tileHeight) * kAnalyticSubpixelScale;
+  for (uint32_t edgeIndex = 0; edgeIndex < uint32_t(edges.size()); ++edgeIndex) {
+    int64_t y0 = std::llround(
+      double(edges[edgeIndex].y0) * kAnalyticSubpixelScale);
+    int64_t y1 = std::llround(
+      double(edges[edgeIndex].y1) * kAnalyticSubpixelScale);
+    if (y0 > y1)
+      std::swap(y0, y1);
+    y0 = std::max<int64_t>(y0, 0);
+    y1 = std::min<int64_t>(y1, imageY1);
+    if (y0 >= y1)
+      continue;
+    const uint32_t firstBand = uint32_t(y0 / bandHeight);
+    const uint32_t lastBand = uint32_t((y1 - 1) / bandHeight);
+    for (uint32_t band = firstBand; band <= lastBand; ++band) {
+      edgeBins[band].push_back(edgeIndex);
+      ++result.binnedEdgeReferences;
+    }
+  }
+
+  constexpr uint32_t kNoTile = std::numeric_limits<uint32_t>::max();
+  std::vector<uint32_t> tileLookup(
+    size_t(result.tilesX) * result.tilesY, kNoTile);
+  std::vector<int64_t> tileValues;
+  const size_t cellsPerTile = size_t(tileWidth) * tileHeight;
+  const auto addCell = [&](uint32_t y, int64_t x, int64_t value) {
+    if (!value || x >= int64_t(width))
+      return;
+    const uint32_t visibleX = x < 0 ? 0u : uint32_t(x);
+    const uint32_t tileX = visibleX / tileWidth;
+    const uint32_t tileY = y / tileHeight;
+    const uint32_t tileId = tileY * result.tilesX + tileX;
+    uint32_t compactIndex = tileLookup[tileId];
+    if (compactIndex == kNoTile) {
+      compactIndex = uint32_t(result.tileIds.size());
+      tileLookup[tileId] = compactIndex;
+      result.tileIds.push_back(tileId);
+      tileValues.resize(tileValues.size() + cellsPerTile, 0);
+    }
+    const uint32_t localX = visibleX - tileX * tileWidth;
+    const uint32_t localY = y - tileY * tileHeight;
+    tileValues[size_t(compactIndex) * cellsPerTile +
+               size_t(localY) * tileWidth + localX] += value;
+  };
+
+  for (uint32_t band = 0; band < result.tilesY; ++band) {
+    const uint32_t yBegin = band * tileHeight;
+    const uint32_t yEnd = std::min(height, yBegin + tileHeight);
+    for (uint32_t edgeIndex : edgeBins[band])
+      rasterizeAnalyticEdge(edges[edgeIndex], yBegin, yEnd, addCell);
+  }
+
+  result.values.resize(tileValues.size());
+  for (size_t i = 0; i < tileValues.size(); ++i) {
+    if (tileValues[i] < std::numeric_limits<int32_t>::min() ||
+        tileValues[i] > std::numeric_limits<int32_t>::max())
+      throw std::runtime_error("analytic tile cell exceeds int32 range");
+    result.values[i] = int32_t(tileValues[i]);
+  }
+  return result;
+}
+
+CoverageDeltas materializeAnalyticTiles(const AnalyticTileCells& tiles) {
+  if (!tiles.width || !tiles.height || !tiles.tileWidth || !tiles.tileHeight ||
+      tiles.tilesX != (tiles.width + tiles.tileWidth - 1u) / tiles.tileWidth ||
+      tiles.tilesY != (tiles.height + tiles.tileHeight - 1u) / tiles.tileHeight)
+    throw std::runtime_error("invalid analytic tile metadata");
+  const size_t cellsPerTile = size_t(tiles.tileWidth) * tiles.tileHeight;
+  if (tiles.values.size() != tiles.tileIds.size() * cellsPerTile)
+    throw std::runtime_error("invalid analytic tile storage size");
+
+  CoverageDeltas result;
+  result.values.resize(size_t(tiles.width) * tiles.height);
+  result.scale = tiles.scale;
+  result.horizontalUnits = uint32_t(kAnalyticSubpixelScale);
+  for (size_t compactIndex = 0; compactIndex < tiles.tileIds.size(); ++compactIndex) {
+    const uint32_t tileId = tiles.tileIds[compactIndex];
+    if (tileId >= tiles.tilesX * tiles.tilesY)
+      throw std::runtime_error("invalid analytic tile id");
+    const uint32_t tileX = tileId % tiles.tilesX;
+    const uint32_t tileY = tileId / tiles.tilesX;
+    const uint32_t x0 = tileX * tiles.tileWidth;
+    const uint32_t y0 = tileY * tiles.tileHeight;
+    const uint32_t copyWidth = std::min(tiles.tileWidth, tiles.width - x0);
+    const uint32_t copyHeight = std::min(tiles.tileHeight, tiles.height - y0);
+    for (uint32_t localY = 0; localY < copyHeight; ++localY) {
+      const int32_t* source = tiles.values.data() +
+        compactIndex * cellsPerTile + size_t(localY) * tiles.tileWidth;
+      int32_t* destination = result.values.data() +
+        size_t(y0 + localY) * tiles.width + x0;
+      std::copy_n(source, copyWidth, destination);
+    }
   }
   return result;
 }
@@ -350,6 +482,12 @@ void validateAnalyticCoverageReference() {
                                    auto&& expected) {
     const CoverageDeltas cells = buildAnalyticCoverageDeltas(
       width, height, edges);
+    const AnalyticTileCells tiles = buildTiledAnalyticCells(
+      width, height, edges, 4, 2);
+    const CoverageDeltas tiledCells = materializeAnalyticTiles(tiles);
+    if (tiledCells.scale != cells.scale || tiledCells.values != cells.values)
+      throw std::runtime_error(
+        "tiled analytic cells differ from dense reference");
     std::vector<uint32_t> coverage(size_t(width) * height);
     scanCoverageScalar(
       coverage, {}, cells.values, width, height, cells.scale, mode);
@@ -411,6 +549,11 @@ void validateAnalyticCoverageReference() {
   };
   const CoverageDeltas triangleCells = buildAnalyticCoverageDeltas(
     width, height, triangle);
+  const CoverageDeltas tiledTriangleCells = materializeAnalyticTiles(
+    buildTiledAnalyticCells(width, height, triangle, 4, 2));
+  if (tiledTriangleCells.values != triangleCells.values)
+    throw std::runtime_error(
+      "tiled analytic triangle differs from dense reference");
   std::vector<uint32_t> triangleCoverage(size_t(width) * height);
   scanCoverageScalar(
     triangleCoverage, {}, triangleCells.values, width, height,

@@ -223,9 +223,11 @@ the synchronized comparison is the fair application-visible answer.
 ## Milestone 5: tiled analytic vector renderer
 
 Status: in progress. The dense scalar analytic-cell reference, exact scan
-backends, fill rules, and gradient paint are complete. Tile binning and sparse
-tile-local accumulation are next; the current dense construction deliberately
-provides the correctness and timing baseline for that change.
+backends, fill rules, and gradient paint are complete. Edges are now binned
+into 16-pixel vertical bands and accumulated into sparse 64x16 cell tiles.
+Exact equivalence, compact memory, construction time, and temporary dense
+materialization are measured separately. A resident tile scan with carry
+between tiles is next so dense materialization and delta upload can disappear.
 
 Integrate the scan into a useful renderer rather than scaling the existing
 brute-force point-in-path loop.

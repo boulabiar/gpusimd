@@ -339,3 +339,37 @@ as separate stages.
 Raw data is stored in `results/intel-uhd-620-analytic-cells.csv` and
 `results/amd-radeon-8060s-analytic-cells.csv` in the ignored machine-local
 results directory.
+
+### Sparse tile-local construction
+
+The first Milestone 5 change bins edges into 16-pixel-high bands and
+accumulates cells in sparse 64x16 tiles. It then materializes a dense delta
+image only to remain compatible with the existing scan kernels. Tile output is
+exactly equal to the dense analytic reference, including tests whose geometry
+crosses tile boundaries.
+
+| CPU | Size | Active tiles | Compact/dense storage | Tile build | Materialize | Dense build | Combined result |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Core i7-8550U | 512 | 69/256 | 27.0% | 0.337 ms | 0.072 ms | 1.071 ms | tiles 2.62x faster |
+| Core i7-8550U | 1024 | 144/1024 | 14.1% | 2.626 ms | 0.297 ms | 2.559 ms | dense 1.14x faster |
+| Core i7-8550U | 2048 | 288/4096 | 7.0% | 5.806 ms | 1.343 ms | 47.769 ms | tiles 6.68x faster |
+| Ryzen AI Max+ 395 | 512 | 69/256 | 27.0% | 0.212 ms | 0.012 ms | 0.113 ms | dense 1.98x faster |
+| Ryzen AI Max+ 395 | 1024 | 144/1024 | 14.1% | 0.448 ms | 0.039 ms | 0.381 ms | dense 1.28x faster |
+| Ryzen AI Max+ 395 | 2048 | 288/4096 | 7.0% | 0.890 ms | 0.328 ms | 6.425 ms | tiles 5.28x faster |
+
+There is a clear crossover rather than a universal tile win. For small dense
+images, bin vectors, tile lookup, and compact allocation cost more than simply
+clearing the dense buffer, especially on the faster CPU. At 2048 square, sparse
+storage avoids clearing a dense 32 MiB 64-bit accumulator and converting every
+pixel, and wins decisively on both CPUs. The compatibility materializer still
+clears the 16 MiB dense output; only 1.18 MiB of compact cells is retained.
+
+The fixed 72-edge heart produced 130, 188, and 302 binned edge references as
+resolution increased. Active tiles grew approximately linearly while the full
+tile grid grew quadratically, which is the expected behavior for sparse path
+boundaries. The next implementation step is to scan these tiles directly with
+per-row carries. That removes the 0.328-1.343 ms materialization stage and, for
+the GPU path, avoids uploading a dense 16 MiB delta buffer.
+
+Raw tile data is stored in `results/intel-i7-8550u-analytic-tiles.csv` and
+`results/amd-ryzen-ai-max-395-analytic-tiles.csv`.
