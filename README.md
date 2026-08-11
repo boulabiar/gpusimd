@@ -7,6 +7,15 @@ question:
 > Does treating GPU invocations as the lanes of one logical SIMD vector work
 > well for a recognizable vector-graphics rasterization workload?
 
+The measured answer is yes, conditionally. Real subgroup shuffle scans are a
+good implementation of analytic coverage, but they are not universally faster
+than shared memory or all-core CPU SIMD in isolation. The practical win appears
+when coverage, paint, and multiple source-over draws remain GPU-resident. In the
+final four-draw 2048-square case, independently measured construction, upload,
+render, and final-readback medians give a 3.16x end-stage win on the Intel UHD
+620 system and 2.66x on the Radeon 8060S system versus persistent all-core AVX2.
+See [RESULTS.md](RESULTS.md) for the stage-by-stage qualifications.
+
 The program renders a filled cubic Bezier heart with an even-odd hole. Cubics
 are flattened into line edges, coverage is computed with configurable NxN
 supersampling, the fill uses a two-dimensional gradient, and the result is

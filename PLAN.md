@@ -271,6 +271,14 @@ Acceptance criteria:
 
 ## Milestone 6: final performance matrix
 
+Status: complete. The final matrix covers the brute-force lane experiment,
+dense and compact analytic scans, subgroup/shared/serialized controls,
+single-path and resident multi-draw rendering, all-core CPU controls, upload,
+synchronization, and final readback on the Intel UHD 620 and Radeon 8060S
+systems. Absolute medians, p90 spread, throughput, exactness, crossovers, and
+the limits of the VectorWare analogy are summarized in `RESULTS.md`; raw
+schema-v3 rows remain in the ignored `results/` directory.
+
 Measure three algorithms, not merely three APIs:
 
 - current brute-force point-in-path baseline;

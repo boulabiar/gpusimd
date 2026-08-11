@@ -509,3 +509,55 @@ Raw measurements are stored in
 `results/amd-radeon-8060s-resident-draw-sweep.csv`,
 `results/intel-uhd-620-resident-2048.csv`, and
 `results/amd-radeon-8060s-resident-2048.csv`.
+
+## Final cross-hardware answer
+
+GPU-distributed SIMD works for practical analytic vector rendering, but GPU
+residency and workload size matter more than the mere existence of wide lanes.
+The table below compares all-core AVX2 with the application-visible GPU boundary
+for representative milestones. Times are medians. The final row sums
+independently measured construction, upload, resident four-draw render, and
+final readback medians on both sides.
+
+| Algorithm and workload | Intel all-core CPU | Intel GPU | Intel result | Radeon all-core CPU | Radeon GPU | Radeon result |
+|---|---:|---:|---:|---:|---:|---:|
+| Brute-force point-in-path, 1024, 72 edges, 4x4 AA | 122.375 ms | 139.848 ms | CPU 1.14x | 9.245 ms | 1.860 ms | GPU 4.97x |
+| Dense analytic scan only, 1024 | 0.687 ms | 2.021 ms | CPU 2.94x | 0.427 ms | 0.110 ms | GPU 3.87x |
+| Dense analytic scan + paint, 1024 | 6.353 ms | 1.021 ms | GPU 6.22x | 0.532 ms | 0.112 ms | GPU 4.74x |
+| Compact resident source-over, 4 draws at 1024 | 24.633 ms | 4.055 ms | GPU 6.07x | 1.768 ms | 0.251 ms | GPU 7.03x |
+| Construction through final readback, 4 draws at 2048 | 80.669 ms | 25.549 ms | GPU 3.16x | 8.010 ms | 3.010 ms | GPU 2.66x |
+
+The brute-force workload executes about 1.208 billion logical edge-sample tests
+per 1024 frame. That corresponds to approximately 9.9 versus 8.6 billion tests
+per second for Intel all-core CPU/GPU and 131 versus 649 billion for Radeon
+all-core CPU/GPU. This metric describes the deliberately expensive baseline;
+it must not be projected onto the analytic renderer, whose scan cost is largely
+independent of path-edge count.
+
+The answers to the four completion questions are:
+
+1. **Do subgroup prefix operations accelerate analytic coverage?** On Intel,
+   the subgroup network materially beats the shared-memory scan. On Radeon it
+   is usually tied and can be slightly slower at 2048. Subgroup operations are
+   a valid primitive, not a universal best algorithm.
+2. **Where is the CPU/GPU crossover?** For scan-only analytic work, the Intel
+   CPU wins at 512 and 1024 and crosses near 2048; Radeon wins by 512. Adding
+   paint moves both systems to a GPU win across the measured 512-2048 range.
+   Tiny odd-size cases are correctness tests, not stable performance evidence.
+3. **Does the win survive a renderer boundary?** Yes. Four compact overlapping
+   draws remain faster after CPU tile construction, packed upload, source-over
+   composition, and final readback: 3.16x on Intel and 2.66x on Radeon at 2048.
+   The 2048 resident synchronized p90/median was 15.511/14.436 ms on Intel and
+   1.229/0.685 ms on Radeon, so host-visible tails remain relevant.
+4. **What transfers from the VectorWare model?** Uniform control with varying
+   lane data, native subgroup width, shuffle-based prefix exchange, and
+   GPU-resident chaining transfer directly. The claim that GPU SIMD is simply
+   faster CPU SIMD does not: GPU subgroups execute under a SIMT scheduler, data
+   preparation and transfer still matter, and shared memory can match subgroup
+   shuffles. The original brute-force lane program validates the programming
+   model; the sparse analytic renderer validates the useful rendering case.
+
+All analytic coverage and composition comparisons are exact. The historical
+1024 brute-force OpenGL result differs at one boundary pixel because of floating
+point edge-intersection rounding; it does not affect the integer analytic
+renderer conclusions.
