@@ -119,9 +119,11 @@ renderer milestone.
 binned into 16-pixel-high bands, combined cover/area cells accumulate in sparse
 64x16 tiles, and only touched tiles are allocated. The program reports active
 tiles, binned edge references, compact versus dense bytes, tile construction,
-and dense materialization separately. Materialization currently feeds the
-existing dense CPU/Vulkan scans and is intentionally visible as a temporary
-compatibility cost; a later resident tile scan will remove it.
+and dense materialization separately. Scalar and AVX2 CPU paths also scan the
+compact tiles directly, carrying signed coverage through inactive tiles without
+constructing dense deltas. Materialization remains visible as a compatibility
+control for the existing Vulkan scan; the resident Vulkan tile path is the next
+step.
 
 `--shapes N` places independent, non-overlapping hearts in a grid. Start with a
 small sweep because the scalar reference deliberately tests every sample

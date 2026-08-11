@@ -32,6 +32,7 @@ struct AnalyticTileCells {
   uint32_t scale = 0;
   uint64_t binnedEdgeReferences = 0;
   std::vector<uint32_t> tileIds;
+  std::vector<uint32_t> tileLookup;
   std::vector<int32_t> values;
 };
 
@@ -55,6 +56,25 @@ AnalyticTileCells buildTiledAnalyticCells(
   uint32_t tileHeight = 16);
 
 CoverageDeltas materializeAnalyticTiles(const AnalyticTileCells& tiles);
+
+void scanAnalyticTilesScalar(
+  std::span<uint32_t> coverage,
+  std::span<uint32_t> pixels,
+  const AnalyticTileCells& tiles,
+  CoverageResolveMode mode = CoverageResolveMode::kEvenOdd);
+
+void scanAnalyticTilesAvx2(
+  std::span<uint32_t> coverage,
+  std::span<uint32_t> pixels,
+  const AnalyticTileCells& tiles,
+  CoverageResolveMode mode = CoverageResolveMode::kEvenOdd);
+
+void scanAnalyticTilesAvx2Threaded(
+  std::span<uint32_t> coverage,
+  std::span<uint32_t> pixels,
+  const AnalyticTileCells& tiles,
+  uint32_t threadCount,
+  CoverageResolveMode mode = CoverageResolveMode::kEvenOdd);
 
 uint32_t resolveCoverageValue(
   int32_t accumulated,

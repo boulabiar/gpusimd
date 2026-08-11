@@ -69,6 +69,112 @@ void paintLanes(
       x + lane, y, width, height, coverage[lane], coverageScale);
 }
 
+struct Avx2CoverageResolver {
+  uint32_t coverageScale;
+  CoverageResolveMode mode;
+  bool vectorEvenOdd;
+  __m256i coverageLimit;
+  __m256i evenOddMask;
+  __m256i evenOddPeriod;
+
+  Avx2CoverageResolver(uint32_t scale, CoverageResolveMode resolveMode)
+    : coverageScale(scale),
+      mode(resolveMode),
+      vectorEvenOdd(false),
+      coverageLimit(_mm256_set1_epi32(int32_t(scale))),
+      evenOddMask(_mm256_setzero_si256()),
+      evenOddPeriod(_mm256_setzero_si256()) {
+    const uint64_t period = uint64_t(scale) * 2u;
+    vectorEvenOdd = mode == CoverageResolveMode::kEvenOdd &&
+      period <= std::numeric_limits<uint32_t>::max() &&
+      (period & (period - 1u)) == 0u;
+    if (vectorEvenOdd) {
+      evenOddMask = _mm256_set1_epi32(int32_t(period - 1u));
+      evenOddPeriod = _mm256_set1_epi32(int32_t(period));
+    }
+  }
+};
+
+void scanCoverageAvx2Span(
+  std::span<uint32_t> coverage,
+  std::span<uint32_t> pixels,
+  const int32_t* deltas,
+  uint32_t width,
+  uint32_t height,
+  uint32_t y,
+  uint32_t xBegin,
+  uint32_t count,
+  int32_t& carry,
+  const Avx2CoverageResolver& resolver) {
+
+  alignas(32) int32_t rawLanes[8];
+  alignas(32) uint32_t resolvedLanes[8];
+  uint32_t offset = 0;
+  for (; offset + 8u <= count; offset += 8u) {
+    const uint32_t x = xBegin + offset;
+    const size_t index = size_t(y) * width + x;
+    __m256i values = deltas
+      ? _mm256_loadu_si256(reinterpret_cast<const __m256i*>(deltas + offset))
+      : _mm256_setzero_si256();
+    values = _mm256_add_epi32(values, _mm256_slli_si256(values, 4));
+    values = _mm256_add_epi32(values, _mm256_slli_si256(values, 8));
+    const int32_t lowerHalf = _mm256_extract_epi32(values, 3);
+    values = _mm256_add_epi32(values, _mm256_setr_epi32(
+      carry, carry, carry, carry,
+      carry + lowerHalf, carry + lowerHalf, carry + lowerHalf, carry + lowerHalf));
+    _mm256_store_si256(reinterpret_cast<__m256i*>(rawLanes), values);
+    carry = rawLanes[7];
+    if (resolver.mode == CoverageResolveMode::kDirect) {
+      _mm256_storeu_si256(reinterpret_cast<__m256i*>(coverage.data() + index), values);
+      paintLanes(
+        pixels, index, x, y, width, height,
+        reinterpret_cast<const uint32_t*>(rawLanes), 8,
+        resolver.coverageScale);
+    }
+    else if (resolver.mode == CoverageResolveMode::kNonZero ||
+             resolver.vectorEvenOdd) {
+      __m256i resolved = _mm256_abs_epi32(values);
+      if (resolver.vectorEvenOdd) {
+        resolved = _mm256_and_si256(resolved, resolver.evenOddMask);
+        resolved = _mm256_min_epu32(
+          resolved, _mm256_sub_epi32(resolver.evenOddPeriod, resolved));
+      }
+      resolved = _mm256_min_epu32(resolved, resolver.coverageLimit);
+      _mm256_storeu_si256(
+        reinterpret_cast<__m256i*>(coverage.data() + index), resolved);
+      if (!pixels.empty()) {
+        _mm256_store_si256(
+          reinterpret_cast<__m256i*>(resolvedLanes), resolved);
+        paintLanes(
+          pixels, index, x, y, width, height,
+          resolvedLanes, 8, resolver.coverageScale);
+      }
+    }
+    else {
+      for (uint32_t lane = 0; lane < 8u; ++lane) {
+        resolvedLanes[lane] = resolveCoverageValue(
+          rawLanes[lane], resolver.coverageScale, resolver.mode);
+        coverage[index + lane] = resolvedLanes[lane];
+      }
+      paintLanes(
+        pixels, index, x, y, width, height,
+        resolvedLanes, 8, resolver.coverageScale);
+    }
+  }
+  for (; offset < count; ++offset) {
+    const uint32_t x = xBegin + offset;
+    const size_t index = size_t(y) * width + x;
+    if (deltas)
+      carry += deltas[offset];
+    const uint32_t resolved = resolveCoverageValue(
+      carry, resolver.coverageScale, resolver.mode);
+    coverage[index] = resolved;
+    if (!pixels.empty())
+      pixels[index] = shadePixel(
+        x, y, width, height, resolved, resolver.coverageScale);
+  }
+}
+
 void scanCoverageAvx2Rows(
   std::span<uint32_t> coverage,
   std::span<uint32_t> pixels,
@@ -80,76 +186,12 @@ void scanCoverageAvx2Rows(
   uint32_t yBegin,
   uint32_t yEnd) {
 
-  alignas(32) int32_t rawLanes[8];
-  alignas(32) uint32_t resolvedLanes[8];
-  const uint64_t evenOddPeriod64 = uint64_t(coverageScale) * 2u;
-  const bool vectorEvenOdd =
-    mode == CoverageResolveMode::kEvenOdd &&
-    evenOddPeriod64 <= std::numeric_limits<uint32_t>::max() &&
-    (evenOddPeriod64 & (evenOddPeriod64 - 1u)) == 0u;
-  const __m256i coverageLimit = _mm256_set1_epi32(int32_t(coverageScale));
-  const __m256i evenOddMask = _mm256_set1_epi32(
-    vectorEvenOdd ? int32_t(evenOddPeriod64 - 1u) : 0);
-  const __m256i evenOddPeriod = _mm256_set1_epi32(
-    vectorEvenOdd ? int32_t(evenOddPeriod64) : 0);
+  const Avx2CoverageResolver resolver(coverageScale, mode);
   for (uint32_t y = yBegin; y < yEnd; ++y) {
     int32_t carry = 0;
-    uint32_t x = 0;
-    for (; x + 8u <= width; x += 8u) {
-      const size_t index = size_t(y) * width + x;
-      __m256i values = _mm256_loadu_si256(
-        reinterpret_cast<const __m256i*>(deltas.data() + index));
-      values = _mm256_add_epi32(values, _mm256_slli_si256(values, 4));
-      values = _mm256_add_epi32(values, _mm256_slli_si256(values, 8));
-      const int32_t lowerHalf = _mm256_extract_epi32(values, 3);
-      values = _mm256_add_epi32(values, _mm256_setr_epi32(
-        carry, carry, carry, carry,
-        carry + lowerHalf, carry + lowerHalf, carry + lowerHalf, carry + lowerHalf));
-      _mm256_store_si256(reinterpret_cast<__m256i*>(rawLanes), values);
-      carry = rawLanes[7];
-      if (mode == CoverageResolveMode::kDirect) {
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(coverage.data() + index), values);
-        paintLanes(
-          pixels, index, x, y, width, height,
-          reinterpret_cast<const uint32_t*>(rawLanes), 8, coverageScale);
-      }
-      else if (mode == CoverageResolveMode::kNonZero || vectorEvenOdd) {
-        __m256i resolved = _mm256_abs_epi32(values);
-        if (vectorEvenOdd) {
-          resolved = _mm256_and_si256(resolved, evenOddMask);
-          resolved = _mm256_min_epu32(
-            resolved, _mm256_sub_epi32(evenOddPeriod, resolved));
-        }
-        resolved = _mm256_min_epu32(resolved, coverageLimit);
-        _mm256_storeu_si256(
-          reinterpret_cast<__m256i*>(coverage.data() + index), resolved);
-        if (!pixels.empty()) {
-          _mm256_store_si256(
-            reinterpret_cast<__m256i*>(resolvedLanes), resolved);
-          paintLanes(
-            pixels, index, x, y, width, height,
-            resolvedLanes, 8, coverageScale);
-        }
-      }
-      else {
-        for (uint32_t lane = 0; lane < 8u; ++lane) {
-          resolvedLanes[lane] = resolveCoverageValue(
-            rawLanes[lane], coverageScale, mode);
-          coverage[index + lane] = resolvedLanes[lane];
-        }
-        paintLanes(
-          pixels, index, x, y, width, height,
-          resolvedLanes, 8, coverageScale);
-      }
-    }
-    for (; x < width; ++x) {
-      const size_t index = size_t(y) * width + x;
-      carry += deltas[index];
-      const uint32_t resolved = resolveCoverageValue(carry, coverageScale, mode);
-      coverage[index] = resolved;
-      if (!pixels.empty())
-        pixels[index] = shadePixel(x, y, width, height, resolved, coverageScale);
-    }
+    scanCoverageAvx2Span(
+      coverage, pixels, deltas.data() + size_t(y) * width,
+      width, height, y, 0, width, carry, resolver);
   }
 }
 
@@ -377,7 +419,7 @@ AnalyticTileCells buildTiledAnalyticCells(
   }
 
   constexpr uint32_t kNoTile = std::numeric_limits<uint32_t>::max();
-  std::vector<uint32_t> tileLookup(
+  result.tileLookup.assign(
     size_t(result.tilesX) * result.tilesY, kNoTile);
   std::vector<int64_t> tileValues;
   const size_t cellsPerTile = size_t(tileWidth) * tileHeight;
@@ -388,10 +430,10 @@ AnalyticTileCells buildTiledAnalyticCells(
     const uint32_t tileX = visibleX / tileWidth;
     const uint32_t tileY = y / tileHeight;
     const uint32_t tileId = tileY * result.tilesX + tileX;
-    uint32_t compactIndex = tileLookup[tileId];
+    uint32_t compactIndex = result.tileLookup[tileId];
     if (compactIndex == kNoTile) {
       compactIndex = uint32_t(result.tileIds.size());
-      tileLookup[tileId] = compactIndex;
+      result.tileLookup[tileId] = compactIndex;
       result.tileIds.push_back(tileId);
       tileValues.resize(tileValues.size() + cellsPerTile, 0);
     }
@@ -418,14 +460,108 @@ AnalyticTileCells buildTiledAnalyticCells(
   return result;
 }
 
-CoverageDeltas materializeAnalyticTiles(const AnalyticTileCells& tiles) {
+namespace {
+
+void validateAnalyticTileStorage(const AnalyticTileCells& tiles) {
   if (!tiles.width || !tiles.height || !tiles.tileWidth || !tiles.tileHeight ||
       tiles.tilesX != (tiles.width + tiles.tileWidth - 1u) / tiles.tileWidth ||
       tiles.tilesY != (tiles.height + tiles.tileHeight - 1u) / tiles.tileHeight)
     throw std::runtime_error("invalid analytic tile metadata");
   const size_t cellsPerTile = size_t(tiles.tileWidth) * tiles.tileHeight;
-  if (tiles.values.size() != tiles.tileIds.size() * cellsPerTile)
+  if (tiles.values.size() != tiles.tileIds.size() * cellsPerTile ||
+      tiles.tileLookup.size() != size_t(tiles.tilesX) * tiles.tilesY)
     throw std::runtime_error("invalid analytic tile storage size");
+  for (size_t compactIndex = 0; compactIndex < tiles.tileIds.size(); ++compactIndex) {
+    const uint32_t tileId = tiles.tileIds[compactIndex];
+    if (tileId >= tiles.tileLookup.size() ||
+        tiles.tileLookup[tileId] != compactIndex)
+      throw std::runtime_error("invalid analytic tile lookup");
+  }
+}
+
+void validateAnalyticTileOutputs(
+  std::span<uint32_t> coverage,
+  std::span<uint32_t> pixels,
+  const AnalyticTileCells& tiles) {
+  validateAnalyticTileStorage(tiles);
+  const size_t count = size_t(tiles.width) * tiles.height;
+  if (coverage.size() != count || (!pixels.empty() && pixels.size() != count))
+    throw std::runtime_error("analytic tile scan buffer size mismatch");
+}
+
+void scanAnalyticTilesScalarRows(
+  std::span<uint32_t> coverage,
+  std::span<uint32_t> pixels,
+  const AnalyticTileCells& tiles,
+  CoverageResolveMode mode,
+  uint32_t yBegin,
+  uint32_t yEnd) {
+
+  const size_t cellsPerTile = size_t(tiles.tileWidth) * tiles.tileHeight;
+  constexpr uint32_t kNoTile = std::numeric_limits<uint32_t>::max();
+  for (uint32_t y = yBegin; y < yEnd; ++y) {
+    int32_t carry = 0;
+    const uint32_t tileY = y / tiles.tileHeight;
+    const uint32_t localY = y % tiles.tileHeight;
+    for (uint32_t tileX = 0; tileX < tiles.tilesX; ++tileX) {
+      const uint32_t xBegin = tileX * tiles.tileWidth;
+      const uint32_t count = std::min(tiles.tileWidth, tiles.width - xBegin);
+      const uint32_t compactIndex =
+        tiles.tileLookup[tileY * tiles.tilesX + tileX];
+      const int32_t* source = compactIndex == kNoTile ? nullptr
+        : tiles.values.data() + size_t(compactIndex) * cellsPerTile +
+          size_t(localY) * tiles.tileWidth;
+      for (uint32_t localX = 0; localX < count; ++localX) {
+        const uint32_t x = xBegin + localX;
+        const size_t index = size_t(y) * tiles.width + x;
+        if (source)
+          carry += source[localX];
+        const uint32_t resolved = resolveCoverageValue(
+          carry, tiles.scale, mode);
+        coverage[index] = resolved;
+        if (!pixels.empty())
+          pixels[index] = shadePixel(
+            x, y, tiles.width, tiles.height, resolved, tiles.scale);
+      }
+    }
+  }
+}
+
+void scanAnalyticTilesAvx2Rows(
+  std::span<uint32_t> coverage,
+  std::span<uint32_t> pixels,
+  const AnalyticTileCells& tiles,
+  CoverageResolveMode mode,
+  uint32_t yBegin,
+  uint32_t yEnd) {
+
+  const size_t cellsPerTile = size_t(tiles.tileWidth) * tiles.tileHeight;
+  constexpr uint32_t kNoTile = std::numeric_limits<uint32_t>::max();
+  const Avx2CoverageResolver resolver(tiles.scale, mode);
+  for (uint32_t y = yBegin; y < yEnd; ++y) {
+    int32_t carry = 0;
+    const uint32_t tileY = y / tiles.tileHeight;
+    const uint32_t localY = y % tiles.tileHeight;
+    for (uint32_t tileX = 0; tileX < tiles.tilesX; ++tileX) {
+      const uint32_t xBegin = tileX * tiles.tileWidth;
+      const uint32_t count = std::min(tiles.tileWidth, tiles.width - xBegin);
+      const uint32_t compactIndex =
+        tiles.tileLookup[tileY * tiles.tilesX + tileX];
+      const int32_t* source = compactIndex == kNoTile ? nullptr
+        : tiles.values.data() + size_t(compactIndex) * cellsPerTile +
+          size_t(localY) * tiles.tileWidth;
+      scanCoverageAvx2Span(
+        coverage, pixels, source, tiles.width, tiles.height,
+        y, xBegin, count, carry, resolver);
+    }
+  }
+}
+
+} // namespace
+
+CoverageDeltas materializeAnalyticTiles(const AnalyticTileCells& tiles) {
+  validateAnalyticTileStorage(tiles);
+  const size_t cellsPerTile = size_t(tiles.tileWidth) * tiles.tileHeight;
 
   CoverageDeltas result;
   result.values.resize(size_t(tiles.width) * tiles.height);
@@ -450,6 +586,55 @@ CoverageDeltas materializeAnalyticTiles(const AnalyticTileCells& tiles) {
     }
   }
   return result;
+}
+
+void scanAnalyticTilesScalar(
+  std::span<uint32_t> coverage,
+  std::span<uint32_t> pixels,
+  const AnalyticTileCells& tiles,
+  CoverageResolveMode mode) {
+  validateAnalyticTileOutputs(coverage, pixels, tiles);
+  scanAnalyticTilesScalarRows(
+    coverage, pixels, tiles, mode, 0, tiles.height);
+}
+
+void scanAnalyticTilesAvx2(
+  std::span<uint32_t> coverage,
+  std::span<uint32_t> pixels,
+  const AnalyticTileCells& tiles,
+  CoverageResolveMode mode) {
+  validateAnalyticTileOutputs(coverage, pixels, tiles);
+  scanAnalyticTilesAvx2Rows(
+    coverage, pixels, tiles, mode, 0, tiles.height);
+}
+
+void scanAnalyticTilesAvx2Threaded(
+  std::span<uint32_t> coverage,
+  std::span<uint32_t> pixels,
+  const AnalyticTileCells& tiles,
+  uint32_t threadCount,
+  CoverageResolveMode mode) {
+  validateAnalyticTileOutputs(coverage, pixels, tiles);
+  threadCount = std::max(1u, std::min(threadCount, tiles.height));
+  if (threadCount == 1u) {
+    scanAnalyticTilesAvx2Rows(
+      coverage, pixels, tiles, mode, 0, tiles.height);
+    return;
+  }
+  std::vector<std::thread> workers;
+  workers.reserve(threadCount);
+  for (uint32_t threadId = 0; threadId < threadCount; ++threadId) {
+    const uint32_t yBegin = uint32_t(
+      uint64_t(tiles.height) * threadId / threadCount);
+    const uint32_t yEnd = uint32_t(
+      uint64_t(tiles.height) * (threadId + 1u) / threadCount);
+    workers.emplace_back([=, &tiles] {
+      scanAnalyticTilesAvx2Rows(
+        coverage, pixels, tiles, mode, yBegin, yEnd);
+    });
+  }
+  for (std::thread& worker : workers)
+    worker.join();
 }
 
 uint32_t resolveCoverageValue(
@@ -491,6 +676,13 @@ void validateAnalyticCoverageReference() {
     std::vector<uint32_t> coverage(size_t(width) * height);
     scanCoverageScalar(
       coverage, {}, cells.values, width, height, cells.scale, mode);
+    std::vector<uint32_t> tiledScalarCoverage(size_t(width) * height);
+    std::vector<uint32_t> tiledAvxCoverage(size_t(width) * height);
+    scanAnalyticTilesScalar(tiledScalarCoverage, {}, tiles, mode);
+    scanAnalyticTilesAvx2(tiledAvxCoverage, {}, tiles, mode);
+    if (tiledScalarCoverage != coverage || tiledAvxCoverage != coverage)
+      throw std::runtime_error(
+        "direct analytic tile scan differs from dense reference");
     for (uint32_t y = 0; y < height; ++y) {
       for (uint32_t x = 0; x < width; ++x) {
         const uint32_t wanted = expected(x, y, cells.scale);

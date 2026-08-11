@@ -226,8 +226,10 @@ Status: in progress. The dense scalar analytic-cell reference, exact scan
 backends, fill rules, and gradient paint are complete. Edges are now binned
 into 16-pixel vertical bands and accumulated into sparse 64x16 cell tiles.
 Exact equivalence, compact memory, construction time, and temporary dense
-materialization are measured separately. A resident tile scan with carry
-between tiles is next so dense materialization and delta upload can disappear.
+materialization are measured separately. Scalar and AVX2 CPU scans now consume
+compact tiles directly and propagate row carries through inactive tiles. The
+equivalent resident Vulkan input path is next so dense materialization and
+dense delta upload can disappear on the GPU as well.
 
 Integrate the scan into a useful renderer rather than scaling the existing
 brute-force point-in-path loop.

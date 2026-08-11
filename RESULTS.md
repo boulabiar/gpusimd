@@ -350,12 +350,12 @@ crosses tile boundaries.
 
 | CPU | Size | Active tiles | Compact/dense storage | Tile build | Materialize | Dense build | Combined result |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Core i7-8550U | 512 | 69/256 | 27.0% | 0.337 ms | 0.072 ms | 1.071 ms | tiles 2.62x faster |
-| Core i7-8550U | 1024 | 144/1024 | 14.1% | 2.626 ms | 0.297 ms | 2.559 ms | dense 1.14x faster |
-| Core i7-8550U | 2048 | 288/4096 | 7.0% | 5.806 ms | 1.343 ms | 47.769 ms | tiles 6.68x faster |
-| Ryzen AI Max+ 395 | 512 | 69/256 | 27.0% | 0.212 ms | 0.012 ms | 0.113 ms | dense 1.98x faster |
-| Ryzen AI Max+ 395 | 1024 | 144/1024 | 14.1% | 0.448 ms | 0.039 ms | 0.381 ms | dense 1.28x faster |
-| Ryzen AI Max+ 395 | 2048 | 288/4096 | 7.0% | 0.890 ms | 0.328 ms | 6.425 ms | tiles 5.28x faster |
+| Core i7-8550U | 512 | 69/256 | 27.1% | 0.337 ms | 0.072 ms | 1.071 ms | tiles 2.62x faster |
+| Core i7-8550U | 1024 | 144/1024 | 14.2% | 2.626 ms | 0.297 ms | 2.559 ms | dense 1.14x faster |
+| Core i7-8550U | 2048 | 288/4096 | 7.1% | 5.806 ms | 1.343 ms | 47.769 ms | tiles 6.68x faster |
+| Ryzen AI Max+ 395 | 512 | 69/256 | 27.1% | 0.212 ms | 0.012 ms | 0.113 ms | dense 1.98x faster |
+| Ryzen AI Max+ 395 | 1024 | 144/1024 | 14.2% | 0.448 ms | 0.039 ms | 0.381 ms | dense 1.28x faster |
+| Ryzen AI Max+ 395 | 2048 | 288/4096 | 7.1% | 0.890 ms | 0.328 ms | 6.425 ms | tiles 5.28x faster |
 
 There is a clear crossover rather than a universal tile win. For small dense
 images, bin vectors, tile lookup, and compact allocation cost more than simply
@@ -373,3 +373,38 @@ the GPU path, avoids uploading a dense 16 MiB delta buffer.
 
 Raw tile data is stored in `results/intel-i7-8550u-analytic-tiles.csv` and
 `results/amd-ryzen-ai-max-395-analytic-tiles.csv`.
+
+### Direct compact-tile CPU scan
+
+Scalar, AVX2, and all-core AVX2 scans now consume compact tiles directly. Each
+row preserves its signed carry while crossing inactive tiles, so solid
+interiors are emitted without materializing zero deltas. All scan and paint
+outputs match the dense reference exactly.
+
+All-core AVX2 scan/paint medians, excluding construction:
+
+| CPU | Size | Dense scan | Direct tile scan | Dense scan+paint | Direct tile scan+paint |
+|---|---:|---:|---:|---:|---:|
+| Core i7-8550U | 512 | 0.360 ms | 0.364 ms | 1.589 ms | 1.480 ms |
+| Core i7-8550U | 1024 | 0.597 ms | 0.936 ms | 4.611 ms | 3.712 ms |
+| Core i7-8550U | 2048 | 3.680 ms | 2.307 ms | 25.624 ms | 14.954 ms |
+| Ryzen AI Max+ 395 | 512 | 0.387 ms | 0.381 ms | 0.405 ms | 0.397 ms |
+| Ryzen AI Max+ 395 | 1024 | 0.414 ms | 0.398 ms | 0.534 ms | 0.548 ms |
+| Ryzen AI Max+ 395 | 2048 | 0.476 ms | 0.446 ms | 1.433 ms | 1.434 ms |
+
+The newer CPU is already fast enough that the direct scan kernel is mostly a
+tie; eliminating materialization is its main benefit. On the older CPU, compact
+reads improve the 2048 scan by 1.60x and scan+paint by 1.71x. The 1024 direct
+scan samples on that machine were noisy, while scan+paint remained faster.
+
+Summing independently measured construction and scan-stage medians, direct
+tiles reduce 2048 construction+all-core scan from 13.198 to 9.983 ms on the
+older CPU and from 1.723 to 1.332 ms on the newer CPU, about 24% in both cases.
+For construction+scan+paint the reductions are 35.142 to 22.630 ms and 2.680
+to 2.320 ms. These sums are diagnostic rather than a substitute for a single
+end-to-end timer, but they show that removing materialization matters even when
+the direct kernel itself is tied.
+
+Raw direct-scan data is stored in
+`results/intel-i7-8550u-direct-tile-scan.csv` and
+`results/amd-ryzen-ai-max-395-direct-tile-scan.csv`.

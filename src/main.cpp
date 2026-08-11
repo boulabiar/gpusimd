@@ -1250,6 +1250,18 @@ int main(int argc, char** argv) {
         std::vector<uint32_t> avxPixels(pixelCount);
         std::vector<uint32_t> threadedScanCoverage(pixelCount);
         std::vector<uint32_t> threadedScanPixels(pixelCount);
+        std::vector<uint32_t> directTileScalarCoverage;
+        std::vector<uint32_t> directTileAvxCoverage;
+        std::vector<uint32_t> directTileThreadedCoverage;
+        std::vector<uint32_t> directTileScalarPixels;
+        std::vector<uint32_t> directTileAvxPixels;
+        std::vector<uint32_t> directTileThreadedPixels;
+        Timing directTileScalarTiming;
+        Timing directTileAvxTiming;
+        Timing directTileThreadedTiming;
+        Timing directTileScalarPaintTiming;
+        Timing directTileAvxPaintTiming;
+        Timing directTileThreadedPaintTiming;
 
         scalarScanTiming = benchmark(options.warmup, options.iterations, [&] {
           gpusimd::scanCoverageScalar(
@@ -1283,6 +1295,42 @@ int main(int argc, char** argv) {
             config.width, config.height, coverageDeltas.scale, config.threads,
             scanResolveMode);
         });
+        if (options.tiledAnalyticCells) {
+          directTileScalarCoverage.resize(pixelCount);
+          directTileAvxCoverage.resize(pixelCount);
+          directTileThreadedCoverage.resize(pixelCount);
+          directTileScalarPixels.resize(pixelCount);
+          directTileAvxPixels.resize(pixelCount);
+          directTileThreadedPixels.resize(pixelCount);
+          directTileScalarTiming = benchmark(options.warmup, options.iterations, [&] {
+            gpusimd::scanAnalyticTilesScalar(
+              directTileScalarCoverage, {}, analyticTiles, scanResolveMode);
+          });
+          directTileAvxTiming = benchmark(options.warmup, options.iterations, [&] {
+            gpusimd::scanAnalyticTilesAvx2(
+              directTileAvxCoverage, {}, analyticTiles, scanResolveMode);
+          });
+          directTileThreadedTiming = benchmark(options.warmup, options.iterations, [&] {
+            gpusimd::scanAnalyticTilesAvx2Threaded(
+              directTileThreadedCoverage, {}, analyticTiles,
+              config.threads, scanResolveMode);
+          });
+          directTileScalarPaintTiming = benchmark(options.warmup, options.iterations, [&] {
+            gpusimd::scanAnalyticTilesScalar(
+              directTileScalarCoverage, directTileScalarPixels,
+              analyticTiles, scanResolveMode);
+          });
+          directTileAvxPaintTiming = benchmark(options.warmup, options.iterations, [&] {
+            gpusimd::scanAnalyticTilesAvx2(
+              directTileAvxCoverage, directTileAvxPixels,
+              analyticTiles, scanResolveMode);
+          });
+          directTileThreadedPaintTiming = benchmark(options.warmup, options.iterations, [&] {
+            gpusimd::scanAnalyticTilesAvx2Threaded(
+              directTileThreadedCoverage, directTileThreadedPixels,
+              analyticTiles, config.threads, scanResolveMode);
+          });
+        }
         const Comparison avxCoverageComparison = compareCoverage(
           scanCoverageReference, avxCoverage);
         const Comparison avxPaintComparison = compareImages(
@@ -1291,6 +1339,26 @@ int main(int argc, char** argv) {
           scanCoverageReference, threadedScanCoverage);
         const Comparison threadedScanPaintComparison = compareImages(
           scanPixelsReference, threadedScanPixels);
+        Comparison directTileScalarComparison;
+        Comparison directTileAvxComparison;
+        Comparison directTileThreadedComparison;
+        Comparison directTileScalarPaintComparison;
+        Comparison directTileAvxPaintComparison;
+        Comparison directTileThreadedPaintComparison;
+        if (options.tiledAnalyticCells) {
+          directTileScalarComparison = compareCoverage(
+            scanCoverageReference, directTileScalarCoverage);
+          directTileAvxComparison = compareCoverage(
+            scanCoverageReference, directTileAvxCoverage);
+          directTileThreadedComparison = compareCoverage(
+            scanCoverageReference, directTileThreadedCoverage);
+          directTileScalarPaintComparison = compareImages(
+            scanPixelsReference, directTileScalarPixels);
+          directTileAvxPaintComparison = compareImages(
+            scanPixelsReference, directTileAvxPixels);
+          directTileThreadedPaintComparison = compareImages(
+            scanPixelsReference, directTileThreadedPixels);
+        }
         std::cout << (options.tiledAnalyticCells
           ? "\nSparse 64x16 analytic tile input: 8-bit subpixels, even-odd fill, scale "
           : options.analyticCells
@@ -1306,7 +1374,8 @@ int main(int argc, char** argv) {
         if (options.tiledAnalyticCells) {
           const uint64_t compactBytes =
             uint64_t(analyticTiles.values.size()) * sizeof(int32_t) +
-            uint64_t(analyticTiles.tileIds.size()) * sizeof(uint32_t);
+            uint64_t(analyticTiles.tileIds.size()) * sizeof(uint32_t) +
+            uint64_t(analyticTiles.tileLookup.size()) * sizeof(uint32_t);
           const uint64_t denseBytes = uint64_t(pixelCount) * sizeof(int32_t);
           std::cout << "  " << analyticTiles.tileIds.size() << "/"
                     << uint64_t(analyticTiles.tilesX) * analyticTiles.tilesY
@@ -1330,6 +1399,35 @@ int main(int argc, char** argv) {
             avxPaintComparison.differingPixels ||
             threadedScanPaintComparison.differingPixels)
           fail("CPU AVX2 coverage scan correctness check failed");
+
+        if (options.tiledAnalyticCells) {
+          std::cout << "\nDirect compact-tile scans (no dense deltas):\n";
+          printTiming("CPU tile scalar scan", directTileScalarTiming,
+                      directTileScalarTiming.medianMs);
+          printTiming("CPU tile AVX2 scan", directTileAvxTiming,
+                      directTileScalarTiming.medianMs);
+          printTiming("CPU tile threaded scan", directTileThreadedTiming,
+                      directTileScalarTiming.medianMs);
+          printTiming("CPU tile scalar + paint", directTileScalarPaintTiming,
+                      directTileScalarPaintTiming.medianMs);
+          printTiming("CPU tile AVX2 + paint", directTileAvxPaintTiming,
+                      directTileScalarPaintTiming.medianMs);
+          printTiming("CPU tile threaded + paint", directTileThreadedPaintTiming,
+                      directTileScalarPaintTiming.medianMs);
+          printCoverageComparison("tile scalar", directTileScalarComparison, pixelCount);
+          printCoverageComparison("tile AVX2", directTileAvxComparison, pixelCount);
+          printCoverageComparison("tile threaded", directTileThreadedComparison, pixelCount);
+          printComparison("tile scalar paint", directTileScalarPaintComparison, pixelCount);
+          printComparison("tile AVX2 paint", directTileAvxPaintComparison, pixelCount);
+          printComparison("tile threaded paint", directTileThreadedPaintComparison, pixelCount);
+          if (directTileScalarComparison.differingPixels ||
+              directTileAvxComparison.differingPixels ||
+              directTileThreadedComparison.differingPixels ||
+              directTileScalarPaintComparison.differingPixels ||
+              directTileAvxPaintComparison.differingPixels ||
+              directTileThreadedPaintComparison.differingPixels)
+            fail("direct analytic tile scan correctness check failed");
+        }
 
         if (options.analyticCells) {
           const Comparison supersampleComparison = compareImages(
@@ -1358,6 +1456,37 @@ int main(int argc, char** argv) {
           rows.push_back(ResultRow{
             config, uint32_t(edges.size()), 1u, "cpu_analytic_tiles", "cpu",
             "analytic_tile_materialization", materializeTiming, 1.0, {}, {}});
+          rows.push_back(ResultRow{
+            config, uint32_t(edges.size()), 1u, "cpu_tile_scan_scalar", "cpu",
+            "analytic_tile_direct_scan", directTileScalarTiming, 1.0,
+            directTileScalarComparison, {}});
+          rows.push_back(ResultRow{
+            config, uint32_t(edges.size()), 1u, "cpu_tile_scan_avx2", "cpu",
+            "analytic_tile_direct_scan", directTileAvxTiming,
+            directTileScalarTiming.medianMs / directTileAvxTiming.medianMs,
+            directTileAvxComparison, {}});
+          rows.push_back(ResultRow{
+            config, uint32_t(edges.size()), std::min(config.threads, config.height),
+            "cpu_tile_scan_avx2_threaded", "cpu", "analytic_tile_direct_scan",
+            directTileThreadedTiming,
+            directTileScalarTiming.medianMs / directTileThreadedTiming.medianMs,
+            directTileThreadedComparison, {}});
+          rows.push_back(ResultRow{
+            config, uint32_t(edges.size()), 1u, "cpu_tile_scan_scalar", "cpu",
+            "analytic_tile_direct_scan_paint", directTileScalarPaintTiming, 1.0,
+            directTileScalarPaintComparison, {}});
+          rows.push_back(ResultRow{
+            config, uint32_t(edges.size()), 1u, "cpu_tile_scan_avx2", "cpu",
+            "analytic_tile_direct_scan_paint", directTileAvxPaintTiming,
+            directTileScalarPaintTiming.medianMs / directTileAvxPaintTiming.medianMs,
+            directTileAvxPaintComparison, {}});
+          rows.push_back(ResultRow{
+            config, uint32_t(edges.size()), std::min(config.threads, config.height),
+            "cpu_tile_scan_avx2_threaded", "cpu",
+            "analytic_tile_direct_scan_paint", directTileThreadedPaintTiming,
+            directTileScalarPaintTiming.medianMs /
+              directTileThreadedPaintTiming.medianMs,
+            directTileThreadedPaintComparison, {}});
         }
 
         rows.push_back(ResultRow{
