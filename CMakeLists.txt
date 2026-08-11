@@ -95,6 +95,12 @@ if(BUILD_TESTING)
       --curve-segments 4 --coverage-scan --no-gpu --no-images
   )
   add_test(
+    NAME analytic_cells_cpu_correctness_smoke
+    COMMAND gpusimd_vector_bench
+      --width 70 --height 37 --aa 2 --iterations 1 --threads 2
+      --curve-segments 4 --analytic-cells --no-gpu --no-images
+  )
+  add_test(
     NAME csv_schema_smoke
     COMMAND ${CMAKE_COMMAND}
       -DBENCHMARK=$<TARGET_FILE:gpusimd_vector_bench>

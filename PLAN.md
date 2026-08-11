@@ -139,10 +139,9 @@ Acceptance criteria:
 
 ## Milestone 4: analytic coverage prefix-scan experiment
 
-Status: focused prefix-scan core complete. True Blend2D-style cover/area cell
-accumulation and the full analytic path suite move into Milestone 5, where they
-can be tested without pretending that sampled coverage deltas are production
-analytic cells.
+Status: complete. The initially sampled bridge remains available, and a second
+mode now supplies true Blend2D-style combined cover/area cell deltas so the
+same scan variants can be exercised with production-shaped analytic data.
 
 Build a focused bridge between the current renderer and Blend2D's analytic
 rasterization model. Start with real vector edges and integer cover/area cell
@@ -183,6 +182,14 @@ Implemented bridge:
   scanline;
 - scan-only and scan-plus-paint timings and exact integer/image comparisons are
   emitted to CSV.
+- a scalar analytic-cell reference quantizes edges to 8-bit subpixels and uses
+  the Blend2D combined-delta identity `cell[x] += cover*512-area`,
+  `cell[x+1] += area`;
+- non-zero and even-odd coverage resolution are implemented on scalar CPU,
+  fully vectorized AVX2, and Vulkan scan paths;
+- invariant tests cover aligned and fractional rectangles, left clipping,
+  winding versus even-odd behavior, and integrated triangle area;
+- analytic cell construction is warmed up and reported as its own CSV stage.
 
 Use integer accumulation wherever the analytic model permits it. This separates
 algorithmic errors from floating-point contraction at path boundaries.
@@ -214,6 +221,11 @@ pixels square. Device-only timestamps show the kernel's larger potential, but
 the synchronized comparison is the fair application-visible answer.
 
 ## Milestone 5: tiled analytic vector renderer
+
+Status: in progress. The dense scalar analytic-cell reference, exact scan
+backends, fill rules, and gradient paint are complete. Tile binning and sparse
+tile-local accumulation are next; the current dense construction deliberately
+provides the correctness and timing baseline for that change.
 
 Integrate the scan into a useful renderer rather than scaling the existing
 brute-force point-in-path loop.

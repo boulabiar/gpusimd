@@ -1,7 +1,7 @@
 #ifndef GPUSIMD_VULKAN_RENDERER_H
 #define GPUSIMD_VULKAN_RENDERER_H
 
-#include "lane_program.h"
+#include "coverage_scan.h"
 
 #include <cstdint>
 #include <memory>
@@ -60,6 +60,7 @@ public:
   VulkanCoverageScanResult runCoverageScan(
     std::span<const int32_t> deltas,
     uint32_t coverageScale,
+    CoverageResolveMode resolveMode,
     CoverageScanAlgorithm algorithm,
     bool paint,
     uint32_t warmup,

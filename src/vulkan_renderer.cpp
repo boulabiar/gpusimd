@@ -109,6 +109,7 @@ struct VulkanRenderer::Impl {
     uint32_t width;
     uint32_t height;
     uint32_t coverageScale;
+    uint32_t resolveMode;
   };
 
   uint32_t width = 0;
@@ -763,6 +764,7 @@ struct VulkanRenderer::Impl {
     CoverageScanAlgorithm algorithm,
     bool paint,
     uint32_t coverageScale,
+    CoverageResolveMode resolveMode,
     bool copyToHost) {
 
     const uint32_t algorithmIndex = uint32_t(algorithm);
@@ -780,7 +782,8 @@ struct VulkanRenderer::Impl {
       scanPipelines[algorithmIndex * 2u + uint32_t(paint)]);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
       scanPipelineLayout, 0, 1, &scanDescriptorSet, 0, nullptr);
-    const ScanPushConstants push{width, height, coverageScale};
+    const ScanPushConstants push{
+      width, height, coverageScale, uint32_t(resolveMode)};
     vkCmdPushConstants(commandBuffer, scanPipelineLayout,
       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     const uint32_t groups = algorithm == CoverageScanAlgorithm::kSerialized
@@ -821,6 +824,7 @@ struct VulkanRenderer::Impl {
   VulkanCoverageScanResult runCoverageScan(
     std::span<const int32_t> deltas,
     uint32_t coverageScale,
+    CoverageResolveMode resolveMode,
     CoverageScanAlgorithm algorithm,
     bool paint,
     uint32_t warmup,
@@ -838,15 +842,18 @@ struct VulkanRenderer::Impl {
     result.timestampMilliseconds.reserve(iterations);
     result.synchronizedMilliseconds.reserve(iterations);
     for (uint32_t i = 0; i < warmup; ++i) {
-      recordCoverageScan(algorithm, paint, coverageScale, false);
+      recordCoverageScan(
+        algorithm, paint, coverageScale, resolveMode, false);
       submitAndWait();
     }
     for (uint32_t i = 0; i < iterations; ++i) {
-      recordCoverageScan(algorithm, paint, coverageScale, false);
+      recordCoverageScan(
+        algorithm, paint, coverageScale, resolveMode, false);
       result.synchronizedMilliseconds.push_back(submitAndWait());
       result.timestampMilliseconds.push_back(readTimestampMilliseconds());
     }
-    recordCoverageScan(algorithm, paint, coverageScale, true);
+    recordCoverageScan(
+      algorithm, paint, coverageScale, resolveMode, true);
     submitAndWait();
 
     result.coverage.resize(pixelCount);
@@ -884,12 +891,14 @@ VulkanRunResult VulkanRenderer::run(
 VulkanCoverageScanResult VulkanRenderer::runCoverageScan(
   std::span<const int32_t> deltas,
   uint32_t coverageScale,
+  CoverageResolveMode resolveMode,
   CoverageScanAlgorithm algorithm,
   bool paint,
   uint32_t warmup,
   uint32_t iterations) {
   return impl_->runCoverageScan(
-    deltas, coverageScale, algorithm, paint, warmup, iterations);
+    deltas, coverageScale, resolveMode,
+    algorithm, paint, warmup, iterations);
 }
 
 } // namespace gpusimd

@@ -24,6 +24,7 @@ layout(push_constant) uniform PushConstants {
   uint width;
   uint height;
   uint coverageScale;
+  uint resolveMode;
 } pc;
 
 shared int scanValues[64];
@@ -45,8 +46,21 @@ uint shadePixel(uint x, uint y, uint cover) {
   return outR | (outG << 8u) | (outB << 16u) | 0xFF000000u;
 }
 
+uint resolveCoverage(int value) {
+  if (pc.resolveMode == 0u)
+    return min(uint(max(value, 0)), pc.coverageScale);
+  uint cover = uint(value < 0 ? -value : value);
+  if (pc.resolveMode == 2u) {
+    uint period = pc.coverageScale * 2u;
+    cover %= period;
+    if (cover > pc.coverageScale)
+      cover = period - cover;
+  }
+  return min(cover, pc.coverageScale);
+}
+
 void writeResult(uint index, uint x, uint y, int value) {
-  uint cover = uint(max(value, 0));
+  uint cover = resolveCoverage(value);
   coverage[index] = cover;
   if (PAINT != 0u)
     pixels[index] = shadePixel(x, y, cover);

@@ -259,3 +259,83 @@ parallel and the intermediate coverage remains resident.
 
 Raw controls are stored in `results/intel-uhd-620-threaded-scan.csv` and
 `results/amd-radeon-8060s-threaded-scan.csv`.
+
+## Blend2D-style analytic cells
+
+The follow-up replaces sampled coverage with the combined analytic-cell delta
+used by Blend2D's raster pipeline. Edges are quantized to 8-bit subpixels; each
+edge fragment contributes `cover*512-area` to its cell and `area` to the next
+cell. A signed horizontal prefix sum followed by non-zero or even-odd folding
+produces coverage on a scale of 131,072. The published heart uses even-odd fill.
+
+Aligned, fractional, clipped, doubled-winding, and diagonal-triangle invariants
+pass. Scalar CPU, fully vectorized AVX2, all-core AVX2, serialized Vulkan,
+shared-memory Vulkan, and subgroup Vulkan outputs all match the scalar analytic
+reference exactly. Against an independent 8x8 supersampled render at 256x256,
+636 of 65,536 edge pixels differed, with maximum channel error 8 and mean
+absolute channel error 0.007347. The images were visually indistinguishable;
+the comparison is a quality cross-check between two antialiasing methods, not
+an expected bit-exact match.
+
+Dense scalar cell-construction medians:
+
+| CPU | 512x512 | 1024x1024 | 2048x2048 |
+|---|---:|---:|---:|
+| Core i7-8550U | 1.071 ms | 2.559 ms | 47.769 ms |
+| Ryzen AI Max+ 395 | 0.113 ms | 0.381 ms | 6.425 ms |
+
+The sharp 2048 increase is the most useful result from this stage. The current
+reference clears and writes a dense 32-bit cell for every target pixel and
+allocates temporary cut storage while splitting edges. At large sizes this
+cost dominates the very fast GPU scan. It directly motivates tile-local sparse
+storage and edge binning rather than further tuning the prefix network first.
+
+The fair scan-only CPU/GPU control below compares AVX2 distributed across all
+requested CPU threads with Vulkan queue submission plus fence synchronization.
+The AVX2 even-odd fold is vectorized; it does not scalarize individual lanes.
+
+| Device and CPU | Size | All-core AVX2 | Synchronized subgroup | Result |
+|---|---:|---:|---:|---:|
+| Intel UHD 620 / 8-thread CPU | 512 | 0.510 ms | 0.741 ms | CPU 1.45x faster |
+| Intel UHD 620 / 8-thread CPU | 1024 | 0.687 ms | 2.021 ms | CPU 2.94x faster |
+| Intel UHD 620 / 8-thread CPU | 2048 | 2.553 ms | 2.018 ms | GPU 1.27x faster |
+| Radeon 8060S / 32-thread CPU | 512 | 0.389 ms | 0.143 ms | GPU 2.72x faster |
+| Radeon 8060S / 32-thread CPU | 1024 | 0.427 ms | 0.110 ms | GPU 3.87x faster |
+| Radeon 8060S / 32-thread CPU | 2048 | 0.472 ms | 0.197 ms | GPU 2.40x faster |
+
+Small CPU scans do not always benefit from all cores because thread
+creation/join is included. For example, one-thread AVX2 took 0.284 ms versus
+0.510 ms with eight threads at 512 square on the Intel CPU. The Intel 1024
+subgroup samples were also unusually variable (0.692 ms minimum, 8.617 ms
+p90), so its 2.021 ms median should not be treated as a stable architecture
+constant.
+
+Scan plus gradient paint favors the GPU more consistently because coverage
+stays resident and each pixel's paint is parallel:
+
+| Device and CPU | Size | All-core AVX2 | Synchronized subgroup | GPU speedup |
+|---|---:|---:|---:|---:|
+| Intel UHD 620 / 8-thread CPU | 512 | 3.702 ms | 1.188 ms | 3.12x |
+| Intel UHD 620 / 8-thread CPU | 1024 | 6.353 ms | 1.021 ms | 6.22x |
+| Intel UHD 620 / 8-thread CPU | 2048 | 18.165 ms | 3.172 ms | 5.73x |
+| Radeon 8060S / 32-thread CPU | 512 | 0.416 ms | 0.123 ms | 3.39x |
+| Radeon 8060S / 32-thread CPU | 1024 | 0.532 ms | 0.112 ms | 4.74x |
+| Radeon 8060S / 32-thread CPU | 2048 | 1.623 ms | 0.750 ms | 2.16x |
+
+On Intel, subgroup device timestamps beat shared memory at all three sizes:
+0.491 versus 0.613 ms, 1.734 versus 2.184 ms, and 1.851 versus 8.659 ms. On
+Radeon they are effectively tied: shared/subgroup times were 0.010/0.012 ms,
+0.031/0.028 ms, and 0.108/0.101 ms. The article-style shuffle network is thus
+valuable on one architecture and merely competitive on the other.
+
+These are still component measurements, not a completed GPU renderer. Vulkan
+delta upload occurs outside the timed dispatch, and cell construction is still
+on the CPU. Adding construction and scan/paint medians illustrates the current
+bottleneck but would omit transfer cost. The next valid end-to-end experiment
+is therefore tile-local cell accumulation feeding the resident subgroup paint,
+with binning, accumulation, upload, scan/paint, and optional readback reported
+as separate stages.
+
+Raw data is stored in `results/intel-uhd-620-analytic-cells.csv` and
+`results/amd-radeon-8060s-analytic-cells.csv` in the ignored machine-local
+results directory.

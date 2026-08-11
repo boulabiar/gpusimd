@@ -73,6 +73,7 @@ struct Options {
   bool writeImages = true;
   bool requireHardwareGpu = false;
   bool coverageScan = false;
+  bool analyticCells = false;
 };
 
 struct Configuration {
@@ -215,6 +216,10 @@ Options parseOptions(int argc, char** argv) {
     else if (arg == "--no-images") options.writeImages = false;
     else if (arg == "--require-hardware-gpu") options.requireHardwareGpu = true;
     else if (arg == "--coverage-scan") options.coverageScan = true;
+    else if (arg == "--analytic-cells") {
+      options.coverageScan = true;
+      options.analyticCells = true;
+    }
     else if (arg == "--help") {
       std::cout
         << "Usage: gpusimd_vector_bench [options]\n"
@@ -228,6 +233,7 @@ Options parseOptions(int argc, char** argv) {
         << "  --curve-segments N use fixed subdivision; about 6N edges/shape\n"
         << "  --shapes N         independent heart shapes in the scene (default 1)\n"
         << "  --coverage-scan    benchmark fixed-point coverage prefix scans\n"
+        << "  --analytic-cells   use Blend2D-style analytic cell deltas (even-odd)\n"
         << "  --scan-y-samples N vertical samples for coverage-delta input (default 64)\n"
         << "  --sweep-sizes LIST comma-separated square image sizes\n"
         << "  --sweep-threads LIST comma-separated CPU worker counts\n"
@@ -1148,6 +1154,8 @@ int main(int argc, char** argv) {
 #if defined(GPUSIMD_HAS_VULKAN)
     bool printedVulkanInfo = false;
 #endif
+    if (options.analyticCells)
+      gpusimd::validateAnalyticCoverageReference();
     for (size_t configurationIndex = 0; configurationIndex < configurations.size(); ++configurationIndex) {
       const Configuration config = configurations[configurationIndex];
       const std::vector<Edge> edges = makeScene(
@@ -1161,6 +1169,9 @@ int main(int argc, char** argv) {
       std::vector<uint32_t> scanPixelsReference;
       Timing scalarScanTiming;
       Timing scalarScanPaintTiming;
+      const gpusimd::CoverageResolveMode scanResolveMode = options.analyticCells
+        ? gpusimd::CoverageResolveMode::kEvenOdd
+        : gpusimd::CoverageResolveMode::kDirect;
 
       std::cout << "\n[" << (configurationIndex + 1u) << '/' << configurations.size() << "] "
                 << config.width << 'x' << config.height
@@ -1201,12 +1212,15 @@ int main(int argc, char** argv) {
                                scalarTiming.medianMs / threadedTiming.medianMs, threadedComparison, {}});
 
       if (options.coverageScan) {
-        const auto buildStart = Clock::now();
-        coverageDeltas = gpusimd::buildCoverageDeltas(
-          config.width, config.height, edges, options.scanVerticalSamples, 256);
-        const auto buildStop = Clock::now();
-        const double buildMs = std::chrono::duration<double, std::milli>(
-          buildStop - buildStart).count();
+        const Timing inputBuildTiming = benchmark(
+          options.warmup, options.iterations, [&] {
+            coverageDeltas = options.analyticCells
+              ? gpusimd::buildAnalyticCoverageDeltas(
+                  config.width, config.height, edges)
+              : gpusimd::buildCoverageDeltas(
+                  config.width, config.height, edges,
+                  options.scanVerticalSamples, 256);
+          });
         scanCoverageReference.resize(pixelCount);
         scanPixelsReference.resize(pixelCount);
         std::vector<uint32_t> avxCoverage(pixelCount);
@@ -1217,32 +1231,34 @@ int main(int argc, char** argv) {
         scalarScanTiming = benchmark(options.warmup, options.iterations, [&] {
           gpusimd::scanCoverageScalar(
             scanCoverageReference, {}, coverageDeltas.values,
-            config.width, config.height, coverageDeltas.scale);
+            config.width, config.height, coverageDeltas.scale, scanResolveMode);
         });
         const Timing avxScanTiming = benchmark(options.warmup, options.iterations, [&] {
           gpusimd::scanCoverageAvx2(
             avxCoverage, {}, coverageDeltas.values,
-            config.width, config.height, coverageDeltas.scale);
+            config.width, config.height, coverageDeltas.scale, scanResolveMode);
         });
         const Timing threadedScanTiming = benchmark(options.warmup, options.iterations, [&] {
           gpusimd::scanCoverageAvx2Threaded(
             threadedScanCoverage, {}, coverageDeltas.values,
-            config.width, config.height, coverageDeltas.scale, config.threads);
+            config.width, config.height, coverageDeltas.scale, config.threads,
+            scanResolveMode);
         });
         scalarScanPaintTiming = benchmark(options.warmup, options.iterations, [&] {
           gpusimd::scanCoverageScalar(
             scanCoverageReference, scanPixelsReference, coverageDeltas.values,
-            config.width, config.height, coverageDeltas.scale);
+            config.width, config.height, coverageDeltas.scale, scanResolveMode);
         });
         const Timing avxScanPaintTiming = benchmark(options.warmup, options.iterations, [&] {
           gpusimd::scanCoverageAvx2(
             avxCoverage, avxPixels, coverageDeltas.values,
-            config.width, config.height, coverageDeltas.scale);
+            config.width, config.height, coverageDeltas.scale, scanResolveMode);
         });
         const Timing threadedScanPaintTiming = benchmark(options.warmup, options.iterations, [&] {
           gpusimd::scanCoverageAvx2Threaded(
             threadedScanCoverage, threadedScanPixels, coverageDeltas.values,
-            config.width, config.height, coverageDeltas.scale, config.threads);
+            config.width, config.height, coverageDeltas.scale, config.threads,
+            scanResolveMode);
         });
         const Comparison avxCoverageComparison = compareCoverage(
           scanCoverageReference, avxCoverage);
@@ -1252,11 +1268,16 @@ int main(int argc, char** argv) {
           scanCoverageReference, threadedScanCoverage);
         const Comparison threadedScanPaintComparison = compareImages(
           scanPixelsReference, threadedScanPixels);
-        std::cout << "\nCoverage-delta input: " << coverageDeltas.verticalSamples
-                  << " vertical samples, " << coverageDeltas.horizontalUnits
-                  << " horizontal units, scale " << coverageDeltas.scale
-                  << "; built in " << std::fixed << std::setprecision(3)
-                  << buildMs << " ms\n";
+        std::cout << (options.analyticCells
+          ? "\nBlend2D-style analytic cell input: 8-bit subpixels, even-odd fill, scale "
+          : "\nCoverage-delta input: " +
+            std::to_string(coverageDeltas.verticalSamples) +
+            " vertical samples, " +
+            std::to_string(coverageDeltas.horizontalUnits) +
+            " horizontal units, scale ")
+                  << coverageDeltas.scale
+                  << "; median construction " << std::fixed << std::setprecision(3)
+                  << inputBuildTiming.medianMs << " ms\n";
         printTiming("CPU scalar coverage scan", scalarScanTiming, scalarScanTiming.medianMs);
         printTiming("CPU AVX2 coverage scan", avxScanTiming, scalarScanTiming.medianMs);
         printTiming("CPU AVX2 threaded scan", threadedScanTiming, scalarScanTiming.medianMs);
@@ -1266,37 +1287,56 @@ int main(int argc, char** argv) {
         printCoverageComparison("CPU AVX2", avxCoverageComparison, pixelCount);
         printCoverageComparison("CPU AVX2 threaded", threadedScanCoverageComparison, pixelCount);
         printComparison("CPU AVX2 scan paint", avxPaintComparison, pixelCount);
-        printComparison("CPU threaded scan paint", threadedScanPaintComparison, pixelCount);
+        printComparison("CPU threaded paint", threadedScanPaintComparison, pixelCount);
         if (avxCoverageComparison.differingPixels ||
             threadedScanCoverageComparison.differingPixels ||
             avxPaintComparison.differingPixels ||
             threadedScanPaintComparison.differingPixels)
           fail("CPU AVX2 coverage scan correctness check failed");
 
+        if (options.analyticCells) {
+          const Comparison supersampleComparison = compareImages(
+            scalarPixels, scanPixelsReference);
+          printComparison("analytic vs supersample", supersampleComparison, pixelCount);
+        }
+
+        const char* scanScope = options.analyticCells
+          ? "analytic_coverage_scan" : "coverage_scan";
+        const char* scanPaintScope = options.analyticCells
+          ? "analytic_coverage_scan_paint" : "coverage_scan_paint";
+
+        rows.push_back(ResultRow{
+          config, uint32_t(edges.size()), 1u,
+          options.analyticCells ? "cpu_analytic_cells" : "cpu_sampled_deltas",
+          "cpu",
+          options.analyticCells
+            ? "analytic_cell_construction" : "coverage_delta_construction",
+          inputBuildTiming, 1.0, {}, {}});
+
         rows.push_back(ResultRow{
           config, uint32_t(edges.size()), 1u, "cpu_scan_scalar", "cpu",
-          "coverage_scan", scalarScanTiming, 1.0, {}, {}});
+          scanScope, scalarScanTiming, 1.0, {}, {}});
         rows.push_back(ResultRow{
           config, uint32_t(edges.size()), 1u, "cpu_scan_avx2", "cpu",
-          "coverage_scan", avxScanTiming,
+          scanScope, avxScanTiming,
           scalarScanTiming.medianMs / avxScanTiming.medianMs,
           avxCoverageComparison, {}});
         rows.push_back(ResultRow{
           config, uint32_t(edges.size()), std::min(config.threads, config.height),
-          "cpu_scan_avx2_threaded", "cpu", "coverage_scan", threadedScanTiming,
+          "cpu_scan_avx2_threaded", "cpu", scanScope, threadedScanTiming,
           scalarScanTiming.medianMs / threadedScanTiming.medianMs,
           threadedScanCoverageComparison, {}});
         rows.push_back(ResultRow{
           config, uint32_t(edges.size()), 1u, "cpu_scan_scalar", "cpu",
-          "coverage_scan_paint", scalarScanPaintTiming, 1.0, {}, {}});
+          scanPaintScope, scalarScanPaintTiming, 1.0, {}, {}});
         rows.push_back(ResultRow{
           config, uint32_t(edges.size()), 1u, "cpu_scan_avx2", "cpu",
-          "coverage_scan_paint", avxScanPaintTiming,
+          scanPaintScope, avxScanPaintTiming,
           scalarScanPaintTiming.medianMs / avxScanPaintTiming.medianMs,
           avxPaintComparison, {}});
         rows.push_back(ResultRow{
           config, uint32_t(edges.size()), std::min(config.threads, config.height),
-          "cpu_scan_avx2_threaded", "cpu", "coverage_scan_paint",
+          "cpu_scan_avx2_threaded", "cpu", scanPaintScope,
           threadedScanPaintTiming,
           scalarScanPaintTiming.medianMs / threadedScanPaintTiming.medianMs,
           threadedScanPaintComparison, {}});
@@ -1309,6 +1349,10 @@ int main(int argc, char** argv) {
         std::filesystem::create_directories(imageDirectory);
         writePpm(imageDirectory / "scalar.ppm", config.width, config.height, scalarPixels);
         writePpm(imageDirectory / "avx2.ppm", config.width, config.height, simdPixels);
+        if (options.coverageScan)
+          writePpm(imageDirectory / (options.analyticCells
+            ? "analytic_cells_cpu.ppm" : "coverage_scan_cpu.ppm"),
+            config.width, config.height, scanPixelsReference);
       }
 
       if (options.gpu && options.openGl) {
@@ -1442,10 +1486,12 @@ int main(int argc, char** argv) {
                                             const char* backend,
                                             const char* displayName) {
             auto scan = renderer.runCoverageScan(
-              coverageDeltas.values, coverageDeltas.scale, algorithm, false,
+              coverageDeltas.values, coverageDeltas.scale, scanResolveMode,
+              algorithm, false,
               options.warmup, options.iterations);
             auto paint = renderer.runCoverageScan(
-              coverageDeltas.values, coverageDeltas.scale, algorithm, true,
+              coverageDeltas.values, coverageDeltas.scale, scanResolveMode,
+              algorithm, true,
               options.warmup, options.iterations);
             const Timing scanTimestamp = summarizeSamples(
               std::move(scan.timestampMilliseconds));
@@ -1497,23 +1543,28 @@ int main(int argc, char** argv) {
                 config, uint32_t(edges.size()), 0u, backend, "vulkan", scope,
                 timing, baseline / timing.medianMs, comparison, gpuInfo});
             };
-            addScanRow("coverage_scan_device_timestamp", scanTimestamp,
+            const std::string scopePrefix = options.analyticCells
+              ? "analytic_coverage_scan" : "coverage_scan";
+            addScanRow((scopePrefix + "_device_timestamp").c_str(), scanTimestamp,
                        scalarScanTiming.medianMs, scanComparison);
-            addScanRow("coverage_scan_synchronized", scanSync,
+            addScanRow((scopePrefix + "_synchronized").c_str(), scanSync,
                        scalarScanTiming.medianMs, scanComparison);
-            addScanRow("coverage_scan_paint_device_timestamp", paintTimestamp,
+            addScanRow((scopePrefix + "_paint_device_timestamp").c_str(), paintTimestamp,
                        scalarScanPaintTiming.medianMs, paintComparison);
-            addScanRow("coverage_scan_paint_synchronized", paintSync,
+            addScanRow((scopePrefix + "_paint_synchronized").c_str(), paintSync,
                        scalarScanPaintTiming.medianMs, paintComparison);
 
             if (options.writeImages &&
                 algorithm == gpusimd::CoverageScanAlgorithm::kSubgroup) {
-              writePpm(imageDirectory / "vulkan_subgroup_scan.ppm",
+              writePpm(imageDirectory / (options.analyticCells
+                ? "vulkan_analytic_subgroup.ppm" : "vulkan_subgroup_scan.ppm"),
                        config.width, config.height, paint.pixels);
             }
           };
 
-          std::cout << "\nVulkan fixed-point coverage scans:\n";
+          std::cout << (options.analyticCells
+            ? "\nVulkan analytic cell coverage scans:\n"
+            : "\nVulkan fixed-point coverage scans:\n");
           runScanAlgorithm(gpusimd::CoverageScanAlgorithm::kSerialized,
                            "gpu_scan_serialized", "serialized");
           runScanAlgorithm(gpusimd::CoverageScanAlgorithm::kSharedMemory,

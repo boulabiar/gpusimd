@@ -66,6 +66,8 @@ Useful options:
 ./build/gpusimd_vector_bench --vulkan --no-opengl
 ./build/gpusimd_vector_bench --coverage-scan --vulkan --no-opengl \
   --width 1024 --height 1024 --curve-segments 12 --no-images
+./build/gpusimd_vector_bench --analytic-cells --vulkan --no-opengl \
+  --width 1024 --height 1024 --curve-segments 12 --no-images
 ./build/gpusimd_vector_bench --help
 ```
 
@@ -97,9 +99,19 @@ visible facets at low segment counts.
 flattened edges, then benchmarks prefix scan alone and prefix scan plus paint.
 `--scan-y-samples N` controls the vertical sampling used to construct this
 bridge workload (default 64). The scan arithmetic itself is exact integer
-arithmetic. This is deliberately not yet a complete Blend2D analytic
-rasterizer: it isolates the cross-lane scan before adding cover/area cell
-generation, tile binning, fill rules, and composition in the next milestone.
+arithmetic.
+
+`--analytic-cells` replaces that sampled input with a scalar reference that
+constructs Blend2D-style combined cover/area cell deltas using 8-bit subpixel
+coordinates. It resolves even-odd coverage and benchmarks the same scalar,
+AVX2, all-core AVX2, serialized Vulkan, shared-memory Vulkan, and subgroup
+Vulkan paths. Cell construction is warmed up and recorded separately in CSV as
+`analytic_cell_construction`; it is not hidden inside a scan-kernel time.
+Non-zero and even-odd resolution are both implemented and covered by analytic
+invariants, while the heart command currently selects even-odd to preserve its
+hole. This remains a dense scanline reference: tile binning, sparse tile-local
+storage, GPU cell accumulation, and multi-draw composition belong to the next
+renderer milestone.
 
 `--shapes N` places independent, non-overlapping hearts in a grid. Start with a
 small sweep because the scalar reference deliberately tests every sample
@@ -157,4 +169,13 @@ For the reproducible subgroup experiment used in `RESULTS.md`:
   --curve-segments 12 --warmup 3 --iterations 7 --threads 8 \
   --coverage-scan --vulkan --no-opengl --no-images \
   --require-hardware-gpu --csv results/coverage-scan.csv
+```
+
+For the true analytic-cell follow-up:
+
+```sh
+./build/gpusimd_vector_bench --sweep-sizes 512,1024,2048 --aa 1 \
+  --curve-segments 12 --warmup 3 --iterations 7 --threads 8 \
+  --analytic-cells --vulkan --no-opengl --no-images \
+  --require-hardware-gpu --csv results/analytic-cells.csv
 ```
