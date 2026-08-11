@@ -1,0 +1,124 @@
+I think the experiment succeeded—but with a more nuanced conclusion than “GPU SIMD is faster.”
+
+  The strongest result is that the article’s execution model genuinely applies to vector rendering. Analytic coverage scanning maps naturally onto GPU subgroups, and the real shuffleUp
+  prefix scan worked correctly on both 32-lane Intel and 64-lane Radeon hardware. This was not merely GPU-shaped scalar code; it used actual cross-lane subgroup operations.
+
+  What we learned:
+
+  - CPU SIMD and GPU subgroup SIMD can express the same logical lane algorithm, but they are not the same execution machinery.
+  - The subgroup scan was materially better than shared memory on Intel, but mostly tied on Radeon. Subgroup primitives are useful, not universally optimal.
+  - Scan-only work is often too small to justify GPU overhead. The Intel CPU won at 512² and 1024² and crossed over only around 2048².
+  - Painting changes the result because it adds parallel pixel work while coverage stays resident. Both GPUs then won across the measured 512²–2048² range.
+  - Sparse tiles mattered more than another small scan optimization. Avoiding dense materialization and a 16 MiB upload produced a larger practical benefit than shaving a few
+    instructions from the prefix scan.
+
+  - Batching several draws mainly reduced submission and synchronization overhead. It did not make the subgroup arithmetic itself faster.
+  - The final renderer result survived construction, upload, composition, and final readback: 3.16× on the Intel UHD 620 system and 2.66× on the Radeon 8060S system versus persistent
+    all-core AVX2.
+
+  So, is running SIMD on the GPU worthwhile? Yes, when:
+
+  - there are enough pixels or draws;
+  - lane communication is regular, such as scans and reductions;
+  - input is compact;
+  - intermediate coverage and pixels stay GPU-resident;
+  - synchronization occurs per batch or frame, not per path.
+
+  It is less attractive for tiny shapes, scan-only microkernels, frequent CPU readback, or workloads with substantial CPU preprocessing and little pixel work.
+
+  The experiment also exposed an important portability lesson: reported subgroup width was not enough. Intel initially created two smaller execution subgroups inside the workgroup.
+  Correctness required subgroup-size control and explicitly requiring a full subgroup. Any system built around “GPU SIMD” must treat lane width and execution guarantees as part of the
+  contract.
+
+  The main limitation is that this still does not prove superiority over production Blend2D. Our CPU analytic renderer is good enough as a controlled AVX2 reference, but Blend2D has
+  years of optimization: persistent worker pools, clipping, command batching, sophisticated edge storage, compositing specializations, and cache-aware pipelines. The experiment
+  supports building a Blend2D-inspired GPU backend; it does not demonstrate that it would beat Blend2D for every real scene.
+
+  My overall judgment: the article’s core abstraction holds. The performance claim only holds after changing the question from “is one GPU SIMD scan faster?” to “can a sparse analytic
+  rendering pipeline keep enough useful work resident on the GPU?” For that second, more realistic question, our answer is clearly yes.
+
+  ---
+
+  External review (After reading README, PLAN, RESULTS, the scan shader, and the CPU lane program)
+
+  Overall: as an engineering artifact and a measurement study this is strong and
+  unusually honest. As a test of the VectorWare article it lands as "the
+  abstraction is real; the performance case for it is narrow, and the money is in
+  the layer the abstraction doesn't touch."
+
+  What's strong:
+
+  - The methodology has better hygiene than most published GPU work. The three
+    questions are properly separated, and the CPU baseline is all-core AVX2
+    (MIMD x SIMD), not single-thread, which is the honest control most "GPU wins"
+    quietly avoid. Device timestamp vs submit+fence vs readback are distinguished
+    and readback cost is not hidden. Medians and p90, software-renderer
+    rejection, CSV schema versioning, byte-exact reference checks with invariant
+    tests.
+  - The subgroup-size-control bug is the crown jewel. Intel reporting a nominal
+    subgroup of 32 while splitting a 32-thread workgroup into two execution
+    subgroups (seams at x=32) until VK_EXT_subgroup_size_control + require-full-
+    subgroups is exactly the "lane width and execution guarantees are part of the
+    contract" lesson. It was hit in practice, not read from a spec.
+  - The Blend2D grounding is real: the combined cover/area cell identity,
+    even-odd/non-zero folds, 8-bit subpixel quantization, sparse 64x16 tiles,
+    and direct compact-tile scan carrying signed carry through inactive tiles.
+    The ScalarOps/Avx2Ops trait over one coverageProgram<Ops> template
+    structurally guarantees the scalar and AVX2 controls run identical logic.
+
+  The sharp part: the data quietly undercuts the article's framing. The article's
+  distinctive claim is the cross-lane one (a warp is an addressable vector; write
+  SIMD, get GPU speed). Here the cross-lane shuffle scan was the least decisive
+  ingredient: modest and architecture-dependent (beats shared memory on Intel,
+  ties or loses on Radeon at 2048). The actual wins came from things the article
+  does not emphasize: eliminating dense materialization, shrinking upload
+  (3.7-14x), keeping coverage resident, and massively parallel paint. Those are
+  generic GPU-programming concerns, not SIMD-lane portability. The honest framing
+  is a conditional rebuttal dressed as a conditional yes: the programming model
+  maps cleanly, but the performance story is "GPU + sparse data + residency,"
+  which ordinary SIMT already delivers.
+
+  One methodological soft spot worth stating out loud: the scan is framed as a
+  full-width parallel prefix scan, the one shape CPUs are worst at and GPUs are
+  best at. Production Blend2D resolves cells with a sparse-sequential sweep over
+  active cells, which is nearly free because most cells are zero. So "GPU
+  subgroup scan beats our AVX2 dense scan" is partly a consequence of the
+  framing, not just Blend2D's years of tuning. Relatedly, subgroupScan() is
+  parallel within a subgroup but serial across chunks via blockCarry (at width
+  2048 / 64 lanes, 32 serialized carry steps per row), which is almost certainly
+  why shared memory catches up at 2048 on Radeon.
+
+  Suggested next steps: (1) add a sparse-sequential CPU cell scan as the real
+  Blend2D-style control -- if the GPU still wins against that, the result gets
+  much stronger; (2) lead the RESULTS conclusion with the residency finding,
+  since the data supports it cleanly and it is the more valuable insight;
+  (3) a discrete GPU with dedicated VRAM would sharpen the upload/residency
+  story, which both shared-memory integrated GPUs currently soften.
+
+  Two clarifications that matter most for reading the results table correctly,
+  and that the summary above glosses over:
+
+  1. The brute-force "distributed GPU" path is NOT a test of the article's
+     distinctive claim. One pixel per invocation is ordinary SIMT with zero
+     cross-lane operations; it validates only that the lane program runs on the
+     GPU, which is trivially true. The single place the article's actual claim
+     (a warp as an addressable vector, using shuffle/ballot) is exercised is the
+     coverage/analytic scan milestone. A reader skimming the final matrix could
+     easily credit the article for the brute-force point-in-path speedups, which
+     have nothing to do with cross-lane execution. Keeping that distinction sharp
+     is what makes the study honest: only the shuffle scan is on trial, and it
+     came back "useful, architecture-dependent," not "faster CPU SIMD."
+
+  2. The through-line to the article critique is that lane-per-thread SIMD is
+     nearly orthogonal to where the GPU wins actually come from. The article
+     pitches "write portable SIMD, the warp is your vector unit." But every
+     decisive win here -- sparse tiles, smaller upload, resident coverage,
+     parallel paint, batched submission -- lives in the tiling / data-movement /
+     residency layer that a Simd<T,N> abstraction does not express at all. The
+     cross-lane primitive it does express turned out to be the marginal factor.
+     So the practical lesson is the inverse of the article's emphasis: the SIMD
+     mapping is the easy, portable, and least important part; the GPU-specific
+     memory and scheduling layer is where the engineering and the speed live.
+     That is not a refutation of the mapping -- it maps cleanly and correctly --
+     but it relocates the value from "SIMD portability" to "GPU-resident sparse
+     pipelines," which is a different and more demanding discipline.
