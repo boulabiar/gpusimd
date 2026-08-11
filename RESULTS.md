@@ -233,3 +233,29 @@ The result supports the article, with limits:
 Raw data is stored in `results/intel-uhd-620-coverage-scan.csv` and
 `results/amd-radeon-8060s-coverage-scan.csv` (the ignored machine-local results
 directory).
+
+### All-core AVX2 control
+
+The scan was subsequently parallelized across independent rows so the CPU
+control uses all available cores as well as eight AVX2 lanes per thread. Thread
+creation and joining are inside the timed CPU call. The GPU column below uses
+queue submission plus fence synchronization, not the smaller device-only
+timestamp.
+
+| Device | Size | All-core AVX2 scan | Synchronized subgroup scan | GPU / CPU result |
+|---|---:|---:|---:|---:|
+| Intel UHD 620 / 8-thread CPU | 512 | 0.360 ms | 0.735 ms | CPU 2.04x faster |
+| Intel UHD 620 / 8-thread CPU | 1024 | 0.563 ms | 0.681 ms | CPU 1.21x faster |
+| Intel UHD 620 / 8-thread CPU | 2048 | 2.525 ms | 4.110 ms | CPU 1.63x faster |
+| Radeon 8060S / 32-thread CPU | 512 | 0.402 ms | 0.105 ms | GPU 3.84x faster |
+| Radeon 8060S / 32-thread CPU | 1024 | 0.443 ms | 0.152 ms | GPU 2.92x faster |
+| Radeon 8060S / 32-thread CPU | 2048 | 0.463 ms | 0.232 ms | GPU 2.00x faster |
+
+This answers the CPU-versus-GPU SIMD question by hardware class rather than
+universally. A modern wide GPU can beat SIMD across a strong many-core CPU for
+the scan itself even after submission overhead; the older integrated GPU
+cannot. Scan plus paint favors the GPU more strongly because the paint work is
+parallel and the intermediate coverage remains resident.
+
+Raw controls are stored in `results/intel-uhd-620-threaded-scan.csv` and
+`results/amd-radeon-8060s-threaded-scan.csv`.

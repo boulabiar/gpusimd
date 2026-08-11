@@ -175,6 +175,8 @@ Implemented bridge:
   using 64 vertical samples and 256 horizontal units;
 - signed deltas are scanned by scalar CPU, AVX2 CPU, serialized GPU,
   shared-memory GPU, and explicit subgroup shuffle-up GPU variants;
+- an all-core AVX2 control distributes independent scanlines across the
+  requested CPU threads and includes thread creation/join in its timing;
 - Vulkan specializes each scan workgroup to the native subgroup width and uses
   subgroup-size control plus the full-subgroup pipeline flag;
 - block carry is propagated between consecutive native-subgroup chunks of a
@@ -205,6 +207,11 @@ pixels square. At 2048 square on the Radeon, shared memory is slightly faster.
 The experiment also showed that querying a nominal subgroup size is
 insufficient: the Intel driver initially selected two smaller execution
 subgroups until the pipeline explicitly required one full subgroup.
+
+Against all CPU cores, synchronized subgroup scan loses on the Intel UHD 620
+but wins on the Radeon 8060S by 3.84x, 2.92x, and 2.00x at 512, 1024, and 2048
+pixels square. Device-only timestamps show the kernel's larger potential, but
+the synchronized comparison is the fair application-visible answer.
 
 ## Milestone 5: tiled analytic vector renderer
 

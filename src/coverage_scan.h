@@ -39,6 +39,15 @@ void scanCoverageAvx2(
   uint32_t height,
   uint32_t coverageScale);
 
+void scanCoverageAvx2Threaded(
+  std::span<uint32_t> coverage,
+  std::span<uint32_t> pixels,
+  std::span<const int32_t> deltas,
+  uint32_t width,
+  uint32_t height,
+  uint32_t coverageScale,
+  uint32_t threadCount);
+
 } // namespace gpusimd
 
 #endif

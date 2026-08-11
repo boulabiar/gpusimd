@@ -1211,6 +1211,8 @@ int main(int argc, char** argv) {
         scanPixelsReference.resize(pixelCount);
         std::vector<uint32_t> avxCoverage(pixelCount);
         std::vector<uint32_t> avxPixels(pixelCount);
+        std::vector<uint32_t> threadedScanCoverage(pixelCount);
+        std::vector<uint32_t> threadedScanPixels(pixelCount);
 
         scalarScanTiming = benchmark(options.warmup, options.iterations, [&] {
           gpusimd::scanCoverageScalar(
@@ -1222,6 +1224,11 @@ int main(int argc, char** argv) {
             avxCoverage, {}, coverageDeltas.values,
             config.width, config.height, coverageDeltas.scale);
         });
+        const Timing threadedScanTiming = benchmark(options.warmup, options.iterations, [&] {
+          gpusimd::scanCoverageAvx2Threaded(
+            threadedScanCoverage, {}, coverageDeltas.values,
+            config.width, config.height, coverageDeltas.scale, config.threads);
+        });
         scalarScanPaintTiming = benchmark(options.warmup, options.iterations, [&] {
           gpusimd::scanCoverageScalar(
             scanCoverageReference, scanPixelsReference, coverageDeltas.values,
@@ -1232,10 +1239,19 @@ int main(int argc, char** argv) {
             avxCoverage, avxPixels, coverageDeltas.values,
             config.width, config.height, coverageDeltas.scale);
         });
+        const Timing threadedScanPaintTiming = benchmark(options.warmup, options.iterations, [&] {
+          gpusimd::scanCoverageAvx2Threaded(
+            threadedScanCoverage, threadedScanPixels, coverageDeltas.values,
+            config.width, config.height, coverageDeltas.scale, config.threads);
+        });
         const Comparison avxCoverageComparison = compareCoverage(
           scanCoverageReference, avxCoverage);
         const Comparison avxPaintComparison = compareImages(
           scanPixelsReference, avxPixels);
+        const Comparison threadedScanCoverageComparison = compareCoverage(
+          scanCoverageReference, threadedScanCoverage);
+        const Comparison threadedScanPaintComparison = compareImages(
+          scanPixelsReference, threadedScanPixels);
         std::cout << "\nCoverage-delta input: " << coverageDeltas.verticalSamples
                   << " vertical samples, " << coverageDeltas.horizontalUnits
                   << " horizontal units, scale " << coverageDeltas.scale
@@ -1243,11 +1259,18 @@ int main(int argc, char** argv) {
                   << buildMs << " ms\n";
         printTiming("CPU scalar coverage scan", scalarScanTiming, scalarScanTiming.medianMs);
         printTiming("CPU AVX2 coverage scan", avxScanTiming, scalarScanTiming.medianMs);
+        printTiming("CPU AVX2 threaded scan", threadedScanTiming, scalarScanTiming.medianMs);
         printTiming("CPU scalar scan + paint", scalarScanPaintTiming, scalarScanPaintTiming.medianMs);
         printTiming("CPU AVX2 scan + paint", avxScanPaintTiming, scalarScanPaintTiming.medianMs);
+        printTiming("CPU AVX2 threaded + paint", threadedScanPaintTiming, scalarScanPaintTiming.medianMs);
         printCoverageComparison("CPU AVX2", avxCoverageComparison, pixelCount);
+        printCoverageComparison("CPU AVX2 threaded", threadedScanCoverageComparison, pixelCount);
         printComparison("CPU AVX2 scan paint", avxPaintComparison, pixelCount);
-        if (avxCoverageComparison.differingPixels || avxPaintComparison.differingPixels)
+        printComparison("CPU threaded scan paint", threadedScanPaintComparison, pixelCount);
+        if (avxCoverageComparison.differingPixels ||
+            threadedScanCoverageComparison.differingPixels ||
+            avxPaintComparison.differingPixels ||
+            threadedScanPaintComparison.differingPixels)
           fail("CPU AVX2 coverage scan correctness check failed");
 
         rows.push_back(ResultRow{
@@ -1259,6 +1282,11 @@ int main(int argc, char** argv) {
           scalarScanTiming.medianMs / avxScanTiming.medianMs,
           avxCoverageComparison, {}});
         rows.push_back(ResultRow{
+          config, uint32_t(edges.size()), std::min(config.threads, config.height),
+          "cpu_scan_avx2_threaded", "cpu", "coverage_scan", threadedScanTiming,
+          scalarScanTiming.medianMs / threadedScanTiming.medianMs,
+          threadedScanCoverageComparison, {}});
+        rows.push_back(ResultRow{
           config, uint32_t(edges.size()), 1u, "cpu_scan_scalar", "cpu",
           "coverage_scan_paint", scalarScanPaintTiming, 1.0, {}, {}});
         rows.push_back(ResultRow{
@@ -1266,6 +1294,12 @@ int main(int argc, char** argv) {
           "coverage_scan_paint", avxScanPaintTiming,
           scalarScanPaintTiming.medianMs / avxScanPaintTiming.medianMs,
           avxPaintComparison, {}});
+        rows.push_back(ResultRow{
+          config, uint32_t(edges.size()), std::min(config.threads, config.height),
+          "cpu_scan_avx2_threaded", "cpu", "coverage_scan_paint",
+          threadedScanPaintTiming,
+          scalarScanPaintTiming.medianMs / threadedScanPaintTiming.medianMs,
+          threadedScanPaintComparison, {}});
       }
 
       const bool multipleOutputs = configurations.size() > 1u;

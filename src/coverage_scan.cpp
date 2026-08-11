@@ -6,6 +6,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 
 namespace gpusimd {
 namespace {
@@ -64,6 +65,45 @@ void paintLanes(
   for (uint32_t lane = 0; lane < laneCount; ++lane)
     pixels[offset + lane] = shadePixel(
       x + lane, y, width, height, coverage[lane], coverageScale);
+}
+
+void scanCoverageAvx2Rows(
+  std::span<uint32_t> coverage,
+  std::span<uint32_t> pixels,
+  std::span<const int32_t> deltas,
+  uint32_t width,
+  uint32_t height,
+  uint32_t coverageScale,
+  uint32_t yBegin,
+  uint32_t yEnd) {
+
+  alignas(32) uint32_t lanes[8];
+  for (uint32_t y = yBegin; y < yEnd; ++y) {
+    int32_t carry = 0;
+    uint32_t x = 0;
+    for (; x + 8u <= width; x += 8u) {
+      const size_t index = size_t(y) * width + x;
+      __m256i values = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i*>(deltas.data() + index));
+      values = _mm256_add_epi32(values, _mm256_slli_si256(values, 4));
+      values = _mm256_add_epi32(values, _mm256_slli_si256(values, 8));
+      const int32_t lowerHalf = _mm256_extract_epi32(values, 3);
+      values = _mm256_add_epi32(values, _mm256_setr_epi32(
+        carry, carry, carry, carry,
+        carry + lowerHalf, carry + lowerHalf, carry + lowerHalf, carry + lowerHalf));
+      _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), values);
+      _mm256_storeu_si256(reinterpret_cast<__m256i*>(coverage.data() + index), values);
+      paintLanes(pixels, index, x, y, width, height, lanes, 8, coverageScale);
+      carry = int32_t(lanes[7]);
+    }
+    for (; x < width; ++x) {
+      const size_t index = size_t(y) * width + x;
+      carry += deltas[index];
+      coverage[index] = uint32_t(carry);
+      if (!pixels.empty())
+        pixels[index] = shadePixel(x, y, width, height, uint32_t(carry), coverageScale);
+    }
+  }
 }
 
 } // namespace
@@ -148,33 +188,41 @@ void scanCoverageAvx2(
   uint32_t coverageScale) {
 
   validateBuffers(coverage, pixels, deltas, width, height);
-  alignas(32) uint32_t lanes[8];
-  for (uint32_t y = 0; y < height; ++y) {
-    int32_t carry = 0;
-    uint32_t x = 0;
-    for (; x + 8u <= width; x += 8u) {
-      const size_t index = size_t(y) * width + x;
-      __m256i values = _mm256_loadu_si256(
-        reinterpret_cast<const __m256i*>(deltas.data() + index));
-      values = _mm256_add_epi32(values, _mm256_slli_si256(values, 4));
-      values = _mm256_add_epi32(values, _mm256_slli_si256(values, 8));
-      const int32_t lowerHalf = _mm256_extract_epi32(values, 3);
-      values = _mm256_add_epi32(values, _mm256_setr_epi32(
-        carry, carry, carry, carry,
-        carry + lowerHalf, carry + lowerHalf, carry + lowerHalf, carry + lowerHalf));
-      _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), values);
-      _mm256_storeu_si256(reinterpret_cast<__m256i*>(coverage.data() + index), values);
-      paintLanes(pixels, index, x, y, width, height, lanes, 8, coverageScale);
-      carry = int32_t(lanes[7]);
-    }
-    for (; x < width; ++x) {
-      const size_t index = size_t(y) * width + x;
-      carry += deltas[index];
-      coverage[index] = uint32_t(carry);
-      if (!pixels.empty())
-        pixels[index] = shadePixel(x, y, width, height, uint32_t(carry), coverageScale);
-    }
+  scanCoverageAvx2Rows(
+    coverage, pixels, deltas, width, height, coverageScale, 0, height);
+}
+
+void scanCoverageAvx2Threaded(
+  std::span<uint32_t> coverage,
+  std::span<uint32_t> pixels,
+  std::span<const int32_t> deltas,
+  uint32_t width,
+  uint32_t height,
+  uint32_t coverageScale,
+  uint32_t threadCount) {
+
+  validateBuffers(coverage, pixels, deltas, width, height);
+  threadCount = std::max(1u, std::min(threadCount, height));
+  if (threadCount == 1u) {
+    scanCoverageAvx2Rows(
+      coverage, pixels, deltas, width, height, coverageScale, 0, height);
+    return;
   }
+
+  std::vector<std::thread> workers;
+  workers.reserve(threadCount);
+  for (uint32_t threadId = 0; threadId < threadCount; ++threadId) {
+    const uint32_t yBegin = uint32_t(
+      uint64_t(height) * threadId / threadCount);
+    const uint32_t yEnd = uint32_t(
+      uint64_t(height) * (threadId + 1u) / threadCount);
+    workers.emplace_back([=] {
+      scanCoverageAvx2Rows(
+        coverage, pixels, deltas, width, height, coverageScale, yBegin, yEnd);
+    });
+  }
+  for (std::thread& worker : workers)
+    worker.join();
 }
 
 } // namespace gpusimd

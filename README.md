@@ -29,6 +29,11 @@ stages. The Vulkan subgroup pipeline requires a full native subgroup through
 subgroup-size control; merely querying the nominal subgroup width proved
 insufficient on real Intel hardware.
 
+The CPU scan is measured both on one AVX2 thread and with independent rows
+distributed across all requested CPU threads. This is the fair control for a
+GPU subgroup: CPU execution combines MIMD cores with eight-lane AVX2, while the
+GPU combines many 32- or 64-lane subgroups.
+
 When `GL_KHR_shader_subgroup` is available, the program queries the hardware
 subgroup size and uses that many invocations as its logical GPU SIMD width. If
 the extension is unavailable, it uses groups of 32 independent invocations and
