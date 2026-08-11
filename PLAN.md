@@ -227,9 +227,12 @@ backends, fill rules, and gradient paint are complete. Edges are now binned
 into 16-pixel vertical bands and accumulated into sparse 64x16 cell tiles.
 Exact equivalence, compact memory, construction time, and temporary dense
 materialization are measured separately. Scalar and AVX2 CPU scans now consume
-compact tiles directly and propagate row carries through inactive tiles. The
-equivalent resident Vulkan input path is next so dense materialization and
-dense delta upload can disappear on the GPU as well.
+compact tiles directly and propagate row carries through inactive tiles.
+Vulkan now consumes the same compact tile values and lookup directly using the
+serialized, shared-memory, and subgroup kernels. Exact-size input buffers and
+sampled upload timings expose the benefit of eliminating dense materialization
+and transfer. The next step is GPU-resident multi-draw paint and source-over
+composition without a synchronization or readback between paths.
 
 Integrate the scan into a useful renderer rather than scaling the existing
 brute-force point-in-path loop.

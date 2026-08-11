@@ -1172,6 +1172,7 @@ int main(int argc, char** argv) {
       std::vector<uint32_t> simdPixels(pixelCount);
       std::vector<uint32_t> threadedPixels(pixelCount);
       gpusimd::CoverageDeltas coverageDeltas;
+      gpusimd::AnalyticTileCells analyticTiles;
       std::vector<uint32_t> scanCoverageReference;
       std::vector<uint32_t> scanPixelsReference;
       Timing scalarScanTiming;
@@ -1221,7 +1222,6 @@ int main(int argc, char** argv) {
       if (options.coverageScan) {
         Timing inputBuildTiming;
         Timing materializeTiming;
-        gpusimd::AnalyticTileCells analyticTiles;
         if (options.tiledAnalyticCells) {
           inputBuildTiming = benchmark(
             options.warmup, options.iterations, [&] {
@@ -1662,15 +1662,22 @@ int main(int argc, char** argv) {
         if (options.coverageScan) {
           const auto runScanAlgorithm = [&](gpusimd::CoverageScanAlgorithm algorithm,
                                             const char* backend,
-                                            const char* displayName) {
-            auto scan = renderer.runCoverageScan(
-              coverageDeltas.values, coverageDeltas.scale, scanResolveMode,
-              algorithm, false,
-              options.warmup, options.iterations);
-            auto paint = renderer.runCoverageScan(
-              coverageDeltas.values, coverageDeltas.scale, scanResolveMode,
-              algorithm, true,
-              options.warmup, options.iterations);
+                                            const char* displayName,
+                                            bool compactTiles) {
+            auto runInput = [&](bool paint) {
+              return compactTiles
+                ? renderer.runAnalyticTileScan(
+                    analyticTiles, scanResolveMode, algorithm, paint,
+                    options.warmup, options.iterations)
+                : renderer.runCoverageScan(
+                    coverageDeltas.values, coverageDeltas.scale, scanResolveMode,
+                    algorithm, paint, options.warmup, options.iterations);
+            };
+            auto scan = runInput(false);
+            auto paint = runInput(true);
+            const Timing uploadTiming = summarizeSamples(
+              std::move(scan.uploadMilliseconds));
+            const uint64_t inputBytes = scan.inputBytes;
             const Timing scanTimestamp = summarizeSamples(
               std::move(scan.timestampMilliseconds));
             const Timing scanSync = summarizeSamples(
@@ -1690,6 +1697,9 @@ int main(int argc, char** argv) {
               std::string("VK ") + displayName + " scan timestamp";
             const std::string paintTimestampName =
               std::string("VK ") + displayName + " paint timestamp";
+            std::cout << "  " << displayName << " input upload: "
+                      << inputBytes << " bytes in " << std::fixed
+                      << std::setprecision(3) << uploadTiming.medianMs << " ms\n";
             printTiming(scanTimestampName.c_str(), scanTimestamp, scalarScanTiming.medianMs);
             printTiming(paintTimestampName.c_str(), paintTimestamp, scalarScanPaintTiming.medianMs);
             printCoverageComparison(displayName, scanComparison, pixelCount);
@@ -1721,9 +1731,13 @@ int main(int argc, char** argv) {
                 config, uint32_t(edges.size()), 0u, backend, "vulkan", scope,
                 timing, baseline / timing.medianMs, comparison, gpuInfo});
             };
-            const std::string scopePrefix = options.tiledAnalyticCells
-              ? "tiled_analytic_coverage_scan"
+            const std::string scopePrefix = compactTiles
+              ? "compact_analytic_tile_scan"
+              : options.tiledAnalyticCells
+                ? "materialized_analytic_tile_scan"
               : options.analyticCells ? "analytic_coverage_scan" : "coverage_scan";
+            addScanRow((scopePrefix + "_upload").c_str(), uploadTiming,
+                       scalarScanTiming.medianMs, {});
             addScanRow((scopePrefix + "_device_timestamp").c_str(), scanTimestamp,
                        scalarScanTiming.medianMs, scanComparison);
             addScanRow((scopePrefix + "_synchronized").c_str(), scanSync,
@@ -1737,7 +1751,9 @@ int main(int argc, char** argv) {
                 algorithm == gpusimd::CoverageScanAlgorithm::kSubgroup) {
               writePpm(imageDirectory / (options.analyticCells
                 ? (options.tiledAnalyticCells
-                    ? "vulkan_analytic_tiles_subgroup.ppm"
+                    ? (compactTiles
+                        ? "vulkan_compact_tiles_subgroup.ppm"
+                        : "vulkan_materialized_tiles_subgroup.ppm")
                     : "vulkan_analytic_subgroup.ppm")
                 : "vulkan_subgroup_scan.ppm"),
                        config.width, config.height, paint.pixels);
@@ -1748,11 +1764,20 @@ int main(int argc, char** argv) {
             ? "\nVulkan analytic cell coverage scans:\n"
             : "\nVulkan fixed-point coverage scans:\n");
           runScanAlgorithm(gpusimd::CoverageScanAlgorithm::kSerialized,
-                           "gpu_scan_serialized", "serialized");
+                           "gpu_scan_serialized", "serialized", false);
           runScanAlgorithm(gpusimd::CoverageScanAlgorithm::kSharedMemory,
-                           "gpu_scan_shared", "shared");
+                           "gpu_scan_shared", "shared", false);
           runScanAlgorithm(gpusimd::CoverageScanAlgorithm::kSubgroup,
-                           "gpu_scan_subgroup", "subgroup");
+                           "gpu_scan_subgroup", "subgroup", false);
+          if (options.tiledAnalyticCells) {
+            std::cout << "\nVulkan direct compact-tile coverage scans:\n";
+            runScanAlgorithm(gpusimd::CoverageScanAlgorithm::kSerialized,
+                             "gpu_tile_scan_serialized", "compact serialized", true);
+            runScanAlgorithm(gpusimd::CoverageScanAlgorithm::kSharedMemory,
+                             "gpu_tile_scan_shared", "compact shared", true);
+            runScanAlgorithm(gpusimd::CoverageScanAlgorithm::kSubgroup,
+                             "gpu_tile_scan_subgroup", "compact subgroup", true);
+          }
         }
       }
 #endif

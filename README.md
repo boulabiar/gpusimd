@@ -121,9 +121,11 @@ binned into 16-pixel-high bands, combined cover/area cells accumulate in sparse
 tiles, binned edge references, compact versus dense bytes, tile construction,
 and dense materialization separately. Scalar and AVX2 CPU paths also scan the
 compact tiles directly, carrying signed coverage through inactive tiles without
-constructing dense deltas. Materialization remains visible as a compatibility
-control for the existing Vulkan scan; the resident Vulkan tile path is the next
-step.
+constructing dense deltas. Vulkan runs both controls: a materialized dense input
+and the compact tile values plus tile lookup consumed directly by every scan
+kernel. Its input buffers are sized to the actual representation, and upload
+time and byte count are reported separately. All paths preserve exact analytic
+coverage and paint output.
 
 `--shapes N` places independent, non-overlapping hearts in a grid. Start with a
 small sweep because the scalar reference deliberately tests every sample
@@ -133,9 +135,10 @@ The program prints median, best, and p90 timings, speedups relative to scalar
 CPU, synchronized GPU dispatch and dispatch-plus-readback times, and correctness
 differences. A synchronized OpenGL dispatch includes command submission and
 `glFinish()` overhead. Vulkan additionally reports device timestamps around the
-compute dispatch, plus independently measured queue-submit/fence and readback
-durations. Warm-ups, pipeline/shader compilation, context/device creation,
-buffer allocation, CSV writing, and image writing are outside timed regions.
+compute dispatch, independently sampled input upload, plus queue-submit/fence
+and readback durations. Warm-ups, pipeline/shader compilation, context/device
+creation, buffer allocation, CSV writing, and image writing are outside timed
+regions.
 
 CSV schema version 3 contains host, OS, CPU, compiler, build type, API,
 vendor/renderer, driver version, hardware/software classification, subgroup

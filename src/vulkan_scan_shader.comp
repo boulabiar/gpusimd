@@ -20,11 +20,19 @@ layout(set = 0, binding = 2, std430) writeonly buffer PixelBuffer {
   uint pixels[];
 };
 
+layout(set = 0, binding = 3, std430) readonly buffer TileLookupBuffer {
+  uint tileLookup[];
+};
+
 layout(push_constant) uniform PushConstants {
   uint width;
   uint height;
   uint coverageScale;
   uint resolveMode;
+  uint inputMode;
+  uint tileWidth;
+  uint tileHeight;
+  uint tilesX;
 } pc;
 
 shared int scanValues[64];
@@ -66,6 +74,20 @@ void writeResult(uint index, uint x, uint y, int value) {
     pixels[index] = shadePixel(x, y, cover);
 }
 
+int loadDelta(uint index, uint x, uint y) {
+  if (pc.inputMode == 0u)
+    return deltas[index];
+  uint tileX = x / pc.tileWidth;
+  uint tileY = y / pc.tileHeight;
+  uint compactIndex = tileLookup[tileY * pc.tilesX + tileX];
+  if (compactIndex == 0xFFFFFFFFu)
+    return 0;
+  uint localX = x - tileX * pc.tileWidth;
+  uint localY = y - tileY * pc.tileHeight;
+  uint cellsPerTile = pc.tileWidth * pc.tileHeight;
+  return deltas[compactIndex * cellsPerTile + localY * pc.tileWidth + localX];
+}
+
 void serializedScan() {
   uint row = gl_GlobalInvocationID.x;
   if (row >= pc.height)
@@ -74,7 +96,7 @@ void serializedScan() {
   uint rowOffset = row * pc.width;
   for (uint x = 0u; x < pc.width; ++x) {
     uint index = rowOffset + x;
-    running += deltas[index];
+    running += loadDelta(index, x, row);
     writeResult(index, x, row, running);
   }
 }
@@ -91,7 +113,8 @@ void sharedMemoryScan() {
   uint rowOffset = row * pc.width;
   for (uint base = 0u; base < pc.width; base += gl_WorkGroupSize.x) {
     uint x = base + lane;
-    scanValues[lane] = x < pc.width ? deltas[rowOffset + x] : 0;
+    scanValues[lane] = x < pc.width
+      ? loadDelta(rowOffset + x, x, row) : 0;
     barrier();
     for (uint offset = 1u; offset < gl_WorkGroupSize.x; offset <<= 1u) {
       int addend = lane >= offset ? scanValues[lane - offset] : 0;
@@ -124,7 +147,7 @@ void subgroupScan() {
     // so this workgroup contains exactly one subgroup and needs no ordering or
     // carry exchange between subgroups.
     uint x = base + gl_SubgroupInvocationID;
-    int delta = x < pc.width ? deltas[rowOffset + x] : 0;
+    int delta = x < pc.width ? loadDelta(rowOffset + x, x, row) : 0;
     int value = delta;
     for (uint offset = 1u; offset < gl_SubgroupSize; offset <<= 1u) {
       int addend = subgroupShuffleUp(value, offset);

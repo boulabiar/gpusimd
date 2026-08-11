@@ -408,3 +408,53 @@ the direct kernel itself is tied.
 Raw direct-scan data is stored in
 `results/intel-i7-8550u-direct-tile-scan.csv` and
 `results/amd-ryzen-ai-max-395-direct-tile-scan.csv`.
+
+### Direct compact-tile Vulkan input
+
+The Vulkan scan kernels now read compact tile values through a tile lookup
+instead of requiring a dense materialized delta image. The same serialized,
+shared-memory, and subgroup implementations run against both representations,
+and all scan and paint outputs match exactly. Input buffers are allocated to
+the representation's actual size; dense coverage and pixel outputs remain full
+image size.
+
+| Size | Dense input | Compact input | Reduction |
+|---:|---:|---:|---:|
+| 512 | 1,048,576 B | 283,648 B | 3.70x |
+| 1024 | 4,194,304 B | 593,920 B | 7.06x |
+| 2048 | 16,777,216 B | 1,196,032 B | 14.03x |
+
+The following diagnostic total adds independently measured stage medians. The
+dense control includes materialization, upload, and synchronized subgroup
+scan+paint; the compact path includes upload and synchronized subgroup
+scan+paint because it does not materialize. Tile construction is common to
+both and is excluded. These sums are not a substitute for a single end-to-end
+timer, but they describe the current CPU-to-GPU input boundary.
+
+| GPU | Size | Dense staged total | Compact staged total | Compact speedup |
+|---|---:|---:|---:|---:|
+| Intel UHD 620 | 512 | 1.649 ms | 1.381 ms | 1.19x |
+| Intel UHD 620 | 1024 | 2.234 ms | 1.478 ms | 1.51x |
+| Intel UHD 620 | 2048 | 8.881 ms | 3.696 ms | 2.40x |
+| Radeon 8060S | 512 | 0.208 ms | 0.149 ms | 1.40x |
+| Radeon 8060S | 1024 | 0.557 ms | 0.364 ms | 1.53x |
+| Radeon 8060S | 2048 | 2.175 ms | 0.334 ms | 6.52x |
+
+The two GPUs reach that result differently. On the Intel GPU, lookup
+indirection is generally neutral or a small kernel cost; most of the overall
+gain comes from removing dense materialization and reducing upload. Its 1024
+compact scan-only timestamp was anomalously slower even though synchronized
+paint remained slightly faster, so it should not be treated as a stable kernel
+result. On the Radeon at 2048, compact input improves median upload by 13.3x,
+device scan+paint by 5.11x, and synchronized scan+paint by 2.84x. The Radeon
+1024 dense paint samples were bimodal, while its 2048 result was stable and is
+the strongest evidence that sparse boundary data improves bandwidth and cache
+behavior on a sufficiently capable GPU.
+
+The remaining renderer boundary is composition rather than scan input: several
+independent paths and paints need to remain GPU-resident, use source-over, and
+synchronize only when the final image is requested.
+
+Raw measurements are stored in
+`results/intel-uhd-620-compact-tile-vulkan.csv` and
+`results/amd-radeon-8060s-compact-tile-vulkan.csv`.

@@ -110,6 +110,10 @@ struct VulkanRenderer::Impl {
     uint32_t height;
     uint32_t coverageScale;
     uint32_t resolveMode;
+    uint32_t inputMode;
+    uint32_t tileWidth;
+    uint32_t tileHeight;
+    uint32_t tilesX;
   };
 
   uint32_t width = 0;
@@ -154,6 +158,7 @@ struct VulkanRenderer::Impl {
     VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
     VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
   Buffer scanDeltaBuffer;
+  Buffer scanTileLookupBuffer;
   Buffer scanCoverageBuffer;
   Buffer scanPixelBuffer;
   Buffer scanCoverageReadback;
@@ -204,6 +209,7 @@ struct VulkanRenderer::Impl {
     destroyBuffer(scanCoverageReadback);
     destroyBuffer(scanPixelBuffer);
     destroyBuffer(scanCoverageBuffer);
+    destroyBuffer(scanTileLookupBuffer);
     destroyBuffer(scanDeltaBuffer);
   }
 
@@ -630,11 +636,43 @@ struct VulkanRenderer::Impl {
     return result;
   }
 
-  void initializeScanResources() {
-    if (scanDescriptorSetLayout)
+  void initializeScanResources(
+    VkDeviceSize inputBytes,
+    VkDeviceSize lookupBytes) {
+    inputBytes = std::max<VkDeviceSize>(sizeof(int32_t), inputBytes);
+    lookupBytes = std::max<VkDeviceSize>(sizeof(uint32_t), lookupBytes);
+    if (scanDescriptorSetLayout &&
+        scanDeltaBuffer.size == inputBytes &&
+        scanTileLookupBuffer.size == lookupBytes)
       return;
+    if (scanDescriptorSetLayout) {
+      destroyBuffer(scanDeltaBuffer);
+      destroyBuffer(scanTileLookupBuffer);
+      scanDeltaBuffer = createBuffer(
+        inputBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+      scanTileLookupBuffer = createBuffer(
+        lookupBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+      const std::array<VkDescriptorBufferInfo, 2> bufferInfos = {{
+        {scanDeltaBuffer.handle, 0, inputBytes},
+        {scanTileLookupBuffer.handle, 0, lookupBytes}
+      }};
+      const std::array<VkWriteDescriptorSet, 2> writes = {{
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, scanDescriptorSet, 0, 0, 1,
+         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bufferInfos[0], nullptr},
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, scanDescriptorSet, 3, 0, 1,
+         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bufferInfos[1], nullptr}
+      }};
+      vkUpdateDescriptorSets(
+        device, uint32_t(writes.size()), writes.data(), 0, nullptr);
+      return;
+    }
     const VkDeviceSize bytes = VkDeviceSize(pixelCount) * sizeof(uint32_t);
-    scanDeltaBuffer = createBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    scanDeltaBuffer = createBuffer(inputBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    scanTileLookupBuffer = createBuffer(
+      lookupBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     scanCoverageBuffer = createBuffer(bytes,
       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -651,10 +689,11 @@ struct VulkanRenderer::Impl {
     vkCheck(vkMapMemory(device, scanPixelReadback.memory, 0, bytes, 0, &scanPixelMapping),
             "vkMapMemory(scan pixels)");
 
-    constexpr std::array<VkDescriptorSetLayoutBinding, 3> bindings = {{
+    constexpr std::array<VkDescriptorSetLayoutBinding, 4> bindings = {{
       {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
       {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-      {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}
+      {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}
     }};
     const VkDescriptorSetLayoutCreateInfo layoutCreate{
       VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0,
@@ -663,7 +702,7 @@ struct VulkanRenderer::Impl {
     vkCheck(vkCreateDescriptorSetLayout(
       device, &layoutCreate, nullptr, &scanDescriptorSetLayout),
       "vkCreateDescriptorSetLayout(scan)");
-    const VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
+    const VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4};
     const VkDescriptorPoolCreateInfo poolCreate{
       VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, 0, 1, 1, &poolSize
     };
@@ -675,18 +714,21 @@ struct VulkanRenderer::Impl {
     };
     vkCheck(vkAllocateDescriptorSets(device, &allocate, &scanDescriptorSet),
             "vkAllocateDescriptorSets(scan)");
-    const std::array<VkDescriptorBufferInfo, 3> bufferInfos = {{
-      {scanDeltaBuffer.handle, 0, bytes},
+    const std::array<VkDescriptorBufferInfo, 4> bufferInfos = {{
+      {scanDeltaBuffer.handle, 0, inputBytes},
       {scanCoverageBuffer.handle, 0, bytes},
-      {scanPixelBuffer.handle, 0, bytes}
+      {scanPixelBuffer.handle, 0, bytes},
+      {scanTileLookupBuffer.handle, 0, lookupBytes}
     }};
-    const std::array<VkWriteDescriptorSet, 3> writes = {{
+    const std::array<VkWriteDescriptorSet, 4> writes = {{
       {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, scanDescriptorSet, 0, 0, 1,
        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bufferInfos[0], nullptr},
       {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, scanDescriptorSet, 1, 0, 1,
        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bufferInfos[1], nullptr},
       {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, scanDescriptorSet, 2, 0, 1,
-       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bufferInfos[2], nullptr}
+       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bufferInfos[2], nullptr},
+      {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, scanDescriptorSet, 3, 0, 1,
+       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bufferInfos[3], nullptr}
     }};
     vkUpdateDescriptorSets(device, uint32_t(writes.size()), writes.data(), 0, nullptr);
 
@@ -750,14 +792,29 @@ struct VulkanRenderer::Impl {
     return pipeline;
   }
 
-  void uploadScanDeltas(std::span<const int32_t> deltas) {
-    if (deltas.size() != pixelCount)
-      vkFail("coverage delta count does not match image dimensions");
+  double uploadScanInput(
+    std::span<const int32_t> deltas,
+    std::span<const uint32_t> tileLookup) {
+    const VkDeviceSize deltaBytes = VkDeviceSize(deltas.size_bytes());
+    const VkDeviceSize lookupBytes = VkDeviceSize(tileLookup.size_bytes());
+    if (!deltaBytes || deltaBytes > scanDeltaBuffer.size ||
+        lookupBytes > scanTileLookupBuffer.size)
+      vkFail("coverage scan input exceeds allocated buffers");
+    const auto start = Clock::now();
     void* mapping = nullptr;
-    vkCheck(vkMapMemory(device, scanDeltaBuffer.memory, 0, scanDeltaBuffer.size, 0, &mapping),
+    vkCheck(vkMapMemory(device, scanDeltaBuffer.memory, 0, deltaBytes, 0, &mapping),
             "vkMapMemory(scan deltas)");
-    std::memcpy(mapping, deltas.data(), size_t(scanDeltaBuffer.size));
+    std::memcpy(mapping, deltas.data(), size_t(deltaBytes));
     vkUnmapMemory(device, scanDeltaBuffer.memory);
+    if (lookupBytes) {
+      vkCheck(vkMapMemory(
+        device, scanTileLookupBuffer.memory, 0, lookupBytes, 0, &mapping),
+        "vkMapMemory(scan tile lookup)");
+      std::memcpy(mapping, tileLookup.data(), size_t(lookupBytes));
+      vkUnmapMemory(device, scanTileLookupBuffer.memory);
+    }
+    const auto stop = Clock::now();
+    return std::chrono::duration<double, std::milli>(stop - start).count();
   }
 
   void recordCoverageScan(
@@ -765,6 +822,10 @@ struct VulkanRenderer::Impl {
     bool paint,
     uint32_t coverageScale,
     CoverageResolveMode resolveMode,
+    uint32_t inputMode,
+    uint32_t tileWidth,
+    uint32_t tileHeight,
+    uint32_t tilesX,
     bool copyToHost) {
 
     const uint32_t algorithmIndex = uint32_t(algorithm);
@@ -783,7 +844,8 @@ struct VulkanRenderer::Impl {
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
       scanPipelineLayout, 0, 1, &scanDescriptorSet, 0, nullptr);
     const ScanPushConstants push{
-      width, height, coverageScale, uint32_t(resolveMode)};
+      width, height, coverageScale, uint32_t(resolveMode),
+      inputMode, tileWidth, tileHeight, tilesX};
     vkCmdPushConstants(commandBuffer, scanPipelineLayout,
       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     const uint32_t groups = algorithm == CoverageScanAlgorithm::kSerialized
@@ -823,8 +885,12 @@ struct VulkanRenderer::Impl {
 
   VulkanCoverageScanResult runCoverageScan(
     std::span<const int32_t> deltas,
+    std::span<const uint32_t> tileLookup,
     uint32_t coverageScale,
     CoverageResolveMode resolveMode,
+    uint32_t tileWidth,
+    uint32_t tileHeight,
+    uint32_t tilesX,
     CoverageScanAlgorithm algorithm,
     bool paint,
     uint32_t warmup,
@@ -836,24 +902,39 @@ struct VulkanRenderer::Impl {
          (subgroupFeatures & VK_SUBGROUP_FEATURE_BALLOT_BIT) == 0 ||
          (subgroupFeatures & VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT) == 0))
       vkFail("required subgroup scan/shuffle operations are unavailable in compute shaders");
-    initializeScanResources();
-    uploadScanDeltas(deltas);
+    const bool tiledInput = !tileLookup.empty();
+    if (!tiledInput && deltas.size() != pixelCount)
+      vkFail("coverage delta count does not match image dimensions");
+    if (tiledInput && (!tileWidth || !tileHeight || !tilesX))
+      vkFail("compact tile input metadata is incomplete");
+    initializeScanResources(
+      VkDeviceSize(deltas.size_bytes()),
+      VkDeviceSize(tileLookup.size_bytes()));
     VulkanCoverageScanResult result;
+    result.inputBytes = uint64_t(deltas.size_bytes() + tileLookup.size_bytes());
+    result.uploadMilliseconds.reserve(iterations);
     result.timestampMilliseconds.reserve(iterations);
     result.synchronizedMilliseconds.reserve(iterations);
+    for (uint32_t i = 0; i < warmup; ++i)
+      uploadScanInput(deltas, tileLookup);
+    for (uint32_t i = 0; i < iterations; ++i)
+      result.uploadMilliseconds.push_back(uploadScanInput(deltas, tileLookup));
     for (uint32_t i = 0; i < warmup; ++i) {
       recordCoverageScan(
-        algorithm, paint, coverageScale, resolveMode, false);
+        algorithm, paint, coverageScale, resolveMode,
+        uint32_t(tiledInput), tileWidth, tileHeight, tilesX, false);
       submitAndWait();
     }
     for (uint32_t i = 0; i < iterations; ++i) {
       recordCoverageScan(
-        algorithm, paint, coverageScale, resolveMode, false);
+        algorithm, paint, coverageScale, resolveMode,
+        uint32_t(tiledInput), tileWidth, tileHeight, tilesX, false);
       result.synchronizedMilliseconds.push_back(submitAndWait());
       result.timestampMilliseconds.push_back(readTimestampMilliseconds());
     }
     recordCoverageScan(
-      algorithm, paint, coverageScale, resolveMode, true);
+      algorithm, paint, coverageScale, resolveMode,
+      uint32_t(tiledInput), tileWidth, tileHeight, tilesX, true);
     submitAndWait();
 
     result.coverage.resize(pixelCount);
@@ -897,7 +978,26 @@ VulkanCoverageScanResult VulkanRenderer::runCoverageScan(
   uint32_t warmup,
   uint32_t iterations) {
   return impl_->runCoverageScan(
-    deltas, coverageScale, resolveMode,
+    deltas, {}, coverageScale, resolveMode, 0, 0, 0,
+    algorithm, paint, warmup, iterations);
+}
+
+VulkanCoverageScanResult VulkanRenderer::runAnalyticTileScan(
+  const AnalyticTileCells& tiles,
+  CoverageResolveMode resolveMode,
+  CoverageScanAlgorithm algorithm,
+  bool paint,
+  uint32_t warmup,
+  uint32_t iterations) {
+  const size_t cellsPerTile = size_t(tiles.tileWidth) * tiles.tileHeight;
+  if (tiles.width != impl_->width || tiles.height != impl_->height ||
+      !tiles.tileWidth || !tiles.tileHeight || !tiles.tilesX ||
+      tiles.values.size() != tiles.tileIds.size() * cellsPerTile ||
+      tiles.tileLookup.size() != size_t(tiles.tilesX) * tiles.tilesY)
+    vkFail("invalid compact analytic tile input");
+  return impl_->runCoverageScan(
+    tiles.values, tiles.tileLookup, tiles.scale, resolveMode,
+    tiles.tileWidth, tiles.tileHeight, tiles.tilesX,
     algorithm, paint, warmup, iterations);
 }
 
