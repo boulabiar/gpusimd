@@ -66,7 +66,11 @@ void renderPixel(uint pixelIndex) {
 }
 
 void main() {
-  uint firstPixel = gl_GlobalInvocationID.x * PIXELS_PER_INVOCATION;
+  uint workgroupIndex = gl_WorkGroupID.x +
+                        gl_WorkGroupID.y * gl_NumWorkGroups.x;
+  uint invocationIndex = workgroupIndex * gl_WorkGroupSize.x +
+                         gl_LocalInvocationID.x;
+  uint firstPixel = invocationIndex * PIXELS_PER_INVOCATION;
   for (uint i = 0u; i < PIXELS_PER_INVOCATION; ++i)
     renderPixel(firstPixel + i);
 }

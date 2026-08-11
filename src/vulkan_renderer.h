@@ -30,6 +30,19 @@ struct VulkanRunResult {
   std::vector<double> readbackMilliseconds;
 };
 
+enum class CoverageScanAlgorithm : uint32_t {
+  kSerialized = 0,
+  kSharedMemory = 1,
+  kSubgroup = 2
+};
+
+struct VulkanCoverageScanResult {
+  std::vector<uint32_t> coverage;
+  std::vector<uint32_t> pixels;
+  std::vector<double> timestampMilliseconds;
+  std::vector<double> synchronizedMilliseconds;
+};
+
 class VulkanRenderer {
 public:
   VulkanRenderer(
@@ -44,6 +57,13 @@ public:
 
   const VulkanDeviceInfo& deviceInfo() const noexcept;
   VulkanRunResult run(uint32_t pixelsPerInvocation, uint32_t warmup, uint32_t iterations);
+  VulkanCoverageScanResult runCoverageScan(
+    std::span<const int32_t> deltas,
+    uint32_t coverageScale,
+    CoverageScanAlgorithm algorithm,
+    bool paint,
+    uint32_t warmup,
+    uint32_t iterations);
 
 private:
   struct Impl;

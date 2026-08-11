@@ -139,6 +139,11 @@ Acceptance criteria:
 
 ## Milestone 4: analytic coverage prefix-scan experiment
 
+Status: focused prefix-scan core complete. True Blend2D-style cover/area cell
+accumulation and the full analytic path suite move into Milestone 5, where they
+can be tested without pretending that sampled coverage deltas are production
+analytic cells.
+
 Build a focused bridge between the current renderer and Blend2D's analytic
 rasterization model. Start with real vector edges and integer cover/area cell
 data, but isolate the scan from edge binning so its cost and benefit are
@@ -164,6 +169,19 @@ Implement these scan variants:
   operations;
 - subgroup scan with explicit carry propagation across subgroup boundaries.
 
+Implemented bridge:
+
+- fixed-point per-pixel coverage is derived from the real flattened heart path
+  using 64 vertical samples and 256 horizontal units;
+- signed deltas are scanned by scalar CPU, AVX2 CPU, serialized GPU,
+  shared-memory GPU, and explicit subgroup shuffle-up GPU variants;
+- Vulkan specializes each scan workgroup to the native subgroup width and uses
+  subgroup-size control plus the full-subgroup pipeline flag;
+- block carry is propagated between consecutive native-subgroup chunks of a
+  scanline;
+- scan-only and scan-plus-paint timings and exact integer/image comparisons are
+  emitted to CSV.
+
 Use integer accumulation wherever the analytic model permits it. This separates
 algorithmic errors from floating-point contraction at path boundaries.
 
@@ -180,6 +198,13 @@ Acceptance criteria:
 
 This milestone is the direct test of the VectorWare article's distinctive
 cross-lane execution claim.
+
+Result: the claim holds conditionally. The subgroup scan beats shared memory on
+the Intel UHD 620 at all measured sizes and on the Radeon 8060S at 512 and 1024
+pixels square. At 2048 square on the Radeon, shared memory is slightly faster.
+The experiment also showed that querying a nominal subgroup size is
+insufficient: the Intel driver initially selected two smaller execution
+subgroups until the pipeline explicitly required one full subgroup.
 
 ## Milestone 5: tiled analytic vector renderer
 

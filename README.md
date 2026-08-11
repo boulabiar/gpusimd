@@ -22,6 +22,13 @@ It benchmarks five execution strategies:
 5. OpenGL compute with eight pixels serialized inside each invocation, as a
    control representing a CPU-like vector kept inside each GPU thread.
 
+The optional coverage-scan experiment adds scalar and AVX2 CPU scans plus three
+Vulkan controls: one serialized invocation per row, a workgroup shared-memory
+scan, and an article-style subgroup scan built from explicit `shuffleUp`
+stages. The Vulkan subgroup pipeline requires a full native subgroup through
+subgroup-size control; merely querying the nominal subgroup width proved
+insufficient on real Intel hardware.
+
 When `GL_KHR_shader_subgroup` is available, the program queries the hardware
 subgroup size and uses that many invocations as its logical GPU SIMD width. If
 the extension is unavailable, it uses groups of 32 independent invocations and
@@ -52,6 +59,8 @@ Useful options:
   --warmup 3 --iterations 7 --no-images --csv results/scaling.csv
 ./build/gpusimd_vector_bench --no-gpu
 ./build/gpusimd_vector_bench --vulkan --no-opengl
+./build/gpusimd_vector_bench --coverage-scan --vulkan --no-opengl \
+  --width 1024 --height 1024 --curve-segments 12 --no-images
 ./build/gpusimd_vector_bench --help
 ```
 
@@ -78,6 +87,14 @@ complexity experiments and reproducible historical baselines: four cubic edges
 and the circular hole produce approximately `6N` flattened edges per shape.
 Fixed subdivision deliberately does not scale with resolution and can show
 visible facets at low segment counts.
+
+`--coverage-scan` builds signed fixed-point coverage deltas from those real
+flattened edges, then benchmarks prefix scan alone and prefix scan plus paint.
+`--scan-y-samples N` controls the vertical sampling used to construct this
+bridge workload (default 64). The scan arithmetic itself is exact integer
+arithmetic. This is deliberately not yet a complete Blend2D analytic
+rasterizer: it isolates the cross-lane scan before adding cover/area cell
+generation, tile binning, fill rules, and composition in the next milestone.
 
 `--shapes N` places independent, non-overlapping hearts in a grid. Start with a
 small sweep because the scalar reference deliberately tests every sample
@@ -127,3 +144,12 @@ with one known workload before launching a sweep:
 
 Adjust `--threads` to that CPU's hardware-thread count. The CSV records both the
 requested count and the number actually used.
+
+For the reproducible subgroup experiment used in `RESULTS.md`:
+
+```sh
+./build/gpusimd_vector_bench --sweep-sizes 512,1024,2048 --aa 1 \
+  --curve-segments 12 --warmup 3 --iterations 7 --threads 8 \
+  --coverage-scan --vulkan --no-opengl --no-images \
+  --require-hardware-gpu --csv results/coverage-scan.csv
+```

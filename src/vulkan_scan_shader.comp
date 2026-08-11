@@ -1,0 +1,139 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+
+layout(constant_id = 0) const uint ALGORITHM = 0u;
+layout(constant_id = 1) const uint PAINT = 0u;
+layout(local_size_x_id = 2, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer DeltaBuffer {
+  int deltas[];
+};
+
+layout(set = 0, binding = 1, std430) writeonly buffer CoverageBuffer {
+  uint coverage[];
+};
+
+layout(set = 0, binding = 2, std430) writeonly buffer PixelBuffer {
+  uint pixels[];
+};
+
+layout(push_constant) uniform PushConstants {
+  uint width;
+  uint height;
+  uint coverageScale;
+} pc;
+
+shared int scanValues[64];
+shared int blockCarry;
+
+uint shadePixel(uint x, uint y, uint cover) {
+  uint alpha = (cover * 255u + pc.coverageScale / 2u) / pc.coverageScale;
+  uint tile = ((x >> 5u) ^ (y >> 5u)) & 1u;
+  uint bgR = tile != 0u ? 30u : 48u;
+  uint bgG = tile != 0u ? 34u : 52u;
+  uint bgB = tile != 0u ? 44u : 64u;
+  uint srcR = 48u + (x * 190u) / (pc.width > 1u ? pc.width - 1u : 1u);
+  uint srcG = 32u + (y * 172u) / (pc.height > 1u ? pc.height - 1u : 1u);
+  uint srcB = 210u;
+  uint invAlpha = 255u - alpha;
+  uint outR = (srcR * alpha + bgR * invAlpha + 127u) / 255u;
+  uint outG = (srcG * alpha + bgG * invAlpha + 127u) / 255u;
+  uint outB = (srcB * alpha + bgB * invAlpha + 127u) / 255u;
+  return outR | (outG << 8u) | (outB << 16u) | 0xFF000000u;
+}
+
+void writeResult(uint index, uint x, uint y, int value) {
+  uint cover = uint(max(value, 0));
+  coverage[index] = cover;
+  if (PAINT != 0u)
+    pixels[index] = shadePixel(x, y, cover);
+}
+
+void serializedScan() {
+  uint row = gl_GlobalInvocationID.x;
+  if (row >= pc.height)
+    return;
+  int running = 0;
+  uint rowOffset = row * pc.width;
+  for (uint x = 0u; x < pc.width; ++x) {
+    uint index = rowOffset + x;
+    running += deltas[index];
+    writeResult(index, x, row, running);
+  }
+}
+
+void sharedMemoryScan() {
+  uint lane = gl_LocalInvocationID.x;
+  uint row = gl_WorkGroupID.x;
+  if (row >= pc.height)
+    return;
+  if (lane == 0u)
+    blockCarry = 0;
+  barrier();
+
+  uint rowOffset = row * pc.width;
+  for (uint base = 0u; base < pc.width; base += gl_WorkGroupSize.x) {
+    uint x = base + lane;
+    scanValues[lane] = x < pc.width ? deltas[rowOffset + x] : 0;
+    barrier();
+    for (uint offset = 1u; offset < gl_WorkGroupSize.x; offset <<= 1u) {
+      int addend = lane >= offset ? scanValues[lane - offset] : 0;
+      barrier();
+      scanValues[lane] += addend;
+      barrier();
+    }
+    int value = scanValues[lane] + blockCarry;
+    if (x < pc.width)
+      writeResult(rowOffset + x, x, row, value);
+    barrier();
+    if (lane == gl_WorkGroupSize.x - 1u)
+      blockCarry += scanValues[gl_WorkGroupSize.x - 1u];
+    barrier();
+  }
+}
+
+void subgroupScan() {
+  uint lane = gl_LocalInvocationID.x;
+  uint row = gl_WorkGroupID.x;
+  if (row >= pc.height)
+    return;
+  if (lane == 0u)
+    blockCarry = 0;
+  barrier();
+
+  uint rowOffset = row * pc.width;
+  for (uint base = 0u; base < pc.width; base += gl_WorkGroupSize.x) {
+    // The host specializes the workgroup to the reported native subgroup size,
+    // so this workgroup contains exactly one subgroup and needs no ordering or
+    // carry exchange between subgroups.
+    uint x = base + gl_SubgroupInvocationID;
+    int delta = x < pc.width ? deltas[rowOffset + x] : 0;
+    int value = delta;
+    for (uint offset = 1u; offset < gl_SubgroupSize; offset <<= 1u) {
+      int addend = subgroupShuffleUp(value, offset);
+      if (gl_SubgroupInvocationID >= offset)
+        value += addend;
+    }
+    int subgroupTotal = subgroupBroadcast(value, gl_SubgroupSize - 1u);
+    value += blockCarry;
+    if (x < pc.width)
+      writeResult(rowOffset + x, x, row, value);
+    barrier();
+
+    if (lane == 0u)
+      blockCarry += subgroupTotal;
+    barrier();
+  }
+}
+
+void main() {
+  if (ALGORITHM == 0u)
+    serializedScan();
+  else if (ALGORITHM == 1u)
+    sharedMemoryScan();
+  else
+    subgroupScan();
+}

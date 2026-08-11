@@ -174,3 +174,62 @@ Raw schema-v3 data is stored in `results/current-intel-vulkan.csv` and
 `results/amd-radeon-8060s-vulkan.csv`. Sub-millisecond host timings can be noisy,
 so device timestamps are the primary kernel measurement and synchronized/readback
 times describe application-visible boundaries.
+
+## Article-style subgroup coverage scan
+
+The focused scan experiment uses the same flattened heart path to construct
+signed fixed-point coverage deltas (64 vertical samples, 256 horizontal units,
+scale 16,384). It then scans consecutive pixels using scalar CPU, AVX2 CPU,
+serialized Vulkan, shared-memory Vulkan, and an explicit subgroup shuffle-up
+prefix network. All coverage values and painted pixels below matched the scalar
+reference exactly.
+
+An important portability bug appeared during development. On the Intel driver,
+a 32-thread workgroup initially contained two execution subgroups even though
+the device reported a nominal subgroup size of 32. Cross-subgroup assumptions
+therefore produced seams at x=32. Specializing the workgroup size was not
+enough. Enabling `VK_EXT_subgroup_size_control`, requesting a 32-lane subgroup
+for the pipeline, and requiring full subgroups made the article-style mapping
+real and corrected the output. The Radeon pipeline analogously requires its
+native 64-lane subgroup.
+
+Scan-only device timestamps:
+
+| Device | Backend | 512x512 | 1024x1024 | 2048x2048 |
+|---|---|---:|---:|---:|
+| Intel UHD 620 | CPU scalar | 0.162 ms | 0.851 ms | 3.638 ms |
+| Intel UHD 620 | Vulkan shared | 0.702 ms | 2.430 ms | 8.695 ms |
+| Intel UHD 620 | Vulkan subgroup shuffle | 0.411 ms | 0.675 ms | 2.711 ms |
+| Radeon 8060S | CPU scalar | 0.071 ms | 0.214 ms | 0.904 ms |
+| Radeon 8060S | Vulkan shared | 0.040 ms | 0.031 ms | 0.105 ms |
+| Radeon 8060S | Vulkan subgroup shuffle | 0.016 ms | 0.028 ms | 0.118 ms |
+
+Scan-plus-paint device timestamps compared with scalar CPU scan-plus-paint:
+
+| Device | Backend | 512x512 | 1024x1024 | 2048x2048 |
+|---|---|---:|---:|---:|
+| Intel UHD 620 | CPU scalar | 3.882 ms | 13.768 ms | 54.714 ms |
+| Intel UHD 620 | Vulkan subgroup shuffle | 0.553 ms | 0.736 ms | 2.988 ms |
+| Radeon 8060S | CPU scalar | 0.918 ms | 3.014 ms | 12.141 ms |
+| Radeon 8060S | Vulkan subgroup shuffle | 0.013 ms | 0.033 ms | 0.640 ms |
+
+The result supports the article, with limits:
+
+- on Intel, subgroup scan is slower than scalar CPU at 512 square, then crosses
+  over at 1024 and reaches 1.34x at 2048; painting makes the GPU advantage much
+  larger because the pixels stay GPU-resident;
+- on the Radeon, subgroup scan is 4.43x, 7.76x, and 7.65x faster than scalar CPU
+  across the three sizes;
+- subgroup shuffle beats shared memory by 1.7-3.6x on Intel and at 512/1024 on
+  Radeon, but Radeon shared memory is slightly faster at 2048 (0.105 vs 0.118
+  ms), so subgroup operations are not a universal best choice;
+- the sub-0.1-ms Radeon samples have visible scheduling/cache variance. Device
+  timestamps are still preferable to host synchronization, but more iterations
+  are warranted before interpreting small differences as architecture laws;
+- the 64-sample input construction is measured separately and is not included
+  in the scan kernel times. This milestone validates the cross-lane primitive,
+  not yet a complete Blend2D-style analytic renderer.
+
+Raw data is stored in `results/intel-uhd-620-coverage-scan.csv` and
+`results/amd-radeon-8060s-coverage-scan.csv` (the ignored machine-local results
+directory).

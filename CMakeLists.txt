@@ -15,6 +15,8 @@ if(GPUSIMD_ENABLE_VULKAN)
 endif()
 
 add_executable(gpusimd_vector_bench
+  src/coverage_scan.cpp
+  src/coverage_scan.h
   src/main.cpp
 )
 
@@ -28,6 +30,8 @@ if(Vulkan_FOUND)
   target_sources(gpusimd_vector_bench PRIVATE
     src/vulkan_renderer.cpp
     src/vulkan_renderer.h
+    src/vulkan_scan_shader.comp
+    src/vulkan_scan_shader_spv.h
     src/vulkan_shader.comp
     src/vulkan_shader_spv.h
   )
@@ -43,6 +47,11 @@ if(Vulkan_FOUND)
         --vn gpusimdVulkanShaderSpv
         -o ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_shader_spv.h
         ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_shader.comp
+      COMMAND ${GPUSIMD_GLSLANG_VALIDATOR}
+        -V --target-env vulkan1.2
+        --vn gpusimdVulkanScanShaderSpv
+        -o ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_scan_shader_spv.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_scan_shader.comp
       COMMENT "Regenerating embedded Vulkan SPIR-V"
       VERBATIM
     )
@@ -78,6 +87,12 @@ if(BUILD_TESTING)
     COMMAND gpusimd_vector_bench
       --width 64 --height 64 --aa 2 --iterations 1 --threads 2
       --curve-segments 4 --no-gpu --no-images
+  )
+  add_test(
+    NAME coverage_scan_cpu_correctness_smoke
+    COMMAND gpusimd_vector_bench
+      --width 70 --height 37 --aa 1 --iterations 1 --threads 2
+      --curve-segments 4 --coverage-scan --no-gpu --no-images
   )
   add_test(
     NAME csv_schema_smoke
