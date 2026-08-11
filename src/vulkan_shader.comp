@@ -1,0 +1,72 @@
+#version 450
+
+layout(constant_id = 0) const uint PIXELS_PER_INVOCATION = 1u;
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer EdgeBuffer {
+  vec4 edgeData[];
+};
+
+layout(set = 0, binding = 1, std430) writeonly buffer PixelBuffer {
+  uint pixels[];
+};
+
+layout(push_constant) uniform PushConstants {
+  uint width;
+  uint height;
+  uint edgeCount;
+  uint aaGrid;
+} pc;
+
+uint shadePixel(uint x, uint y, uint hits) {
+  uint sampleCount = pc.aaGrid * pc.aaGrid;
+  uint alpha = (hits * 255u + sampleCount / 2u) / sampleCount;
+
+  uint tile = ((x >> 5u) ^ (y >> 5u)) & 1u;
+  uint bgR = tile != 0u ? 30u : 48u;
+  uint bgG = tile != 0u ? 34u : 52u;
+  uint bgB = tile != 0u ? 44u : 64u;
+
+  uint srcR = 48u + (x * 190u) / (pc.width > 1u ? pc.width - 1u : 1u);
+  uint srcG = 32u + (y * 172u) / (pc.height > 1u ? pc.height - 1u : 1u);
+  uint srcB = 210u;
+  uint invAlpha = 255u - alpha;
+
+  uint outR = (srcR * alpha + bgR * invAlpha + 127u) / 255u;
+  uint outG = (srcG * alpha + bgG * invAlpha + 127u) / 255u;
+  uint outB = (srcB * alpha + bgB * invAlpha + 127u) / 255u;
+  return outR | (outG << 8u) | (outB << 16u) | 0xFF000000u;
+}
+
+void renderPixel(uint pixelIndex) {
+  uint pixelCount = pc.width * pc.height;
+  if (pixelIndex >= pixelCount)
+    return;
+
+  uint x = pixelIndex % pc.width;
+  uint y = pixelIndex / pc.width;
+  uint hits = 0u;
+
+  for (uint sampleY = 0u; sampleY < pc.aaGrid; ++sampleY) {
+    float sy = float(y) + (float(sampleY) + 0.5) / float(pc.aaGrid);
+    for (uint sampleX = 0u; sampleX < pc.aaGrid; ++sampleX) {
+      float sx = float(x) + (float(sampleX) + 0.5) / float(pc.aaGrid);
+      bool inside = false;
+
+      for (uint edgeIndex = 0u; edgeIndex < pc.edgeCount; ++edgeIndex) {
+        vec4 edge = edgeData[edgeIndex];
+        bool straddles = (edge.y > sy) != (edge.z > sy);
+        float xIntersection = edge.x + (sy - edge.y) * edge.w;
+        inside = inside != (straddles && sx < xIntersection);
+      }
+      hits += inside ? 1u : 0u;
+    }
+  }
+  pixels[pixelIndex] = shadePixel(x, y, hits);
+}
+
+void main() {
+  uint firstPixel = gl_GlobalInvocationID.x * PIXELS_PER_INVOCATION;
+  for (uint i = 0u; i < PIXELS_PER_INVOCATION; ++i)
+    renderPixel(firstPixel + i);
+}

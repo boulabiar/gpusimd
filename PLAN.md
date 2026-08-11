@@ -104,10 +104,12 @@ The renderer now uses recursive de Casteljau subdivision with a 0.25-pixel
 screen-space error threshold by default. The circular subpath uses the same
 tolerance. Fixed `--curve-segments N` subdivision remains available for the
 published 72-edge baseline and controlled synthetic complexity sweeps. CSV
-schema version 2 records which mode produced each result so adaptive and fixed
+schema version 3 records which mode produced each result so adaptive and fixed
 workloads cannot be compared accidentally.
 
 ## Milestone 3: optional Vulkan subgroup backend
+
+Status: complete.
 
 Retain OpenGL as a baseline and add Vulkan as an optional CMake component.
 Vulkan is preferred for the subgroup experiment because it exposes subgroup

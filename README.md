@@ -51,7 +51,19 @@ Useful options:
   --sweep-threads 1,8 --sweep-curve-segments 12,48 \
   --warmup 3 --iterations 7 --no-images --csv results/scaling.csv
 ./build/gpusimd_vector_bench --no-gpu
+./build/gpusimd_vector_bench --vulkan --no-opengl
 ./build/gpusimd_vector_bench --help
+```
+
+Vulkan is enabled automatically when CMake finds its headers and loader. Use
+`-DGPUSIMD_ENABLE_VULKAN=OFF` to verify an OpenGL/CPU-only build. `--vulkan`
+runs Vulkan in addition to OpenGL; combine it with `--no-opengl` for a
+Vulkan-only run. The checked-in SPIR-V lets systems build without a shader
+compiler. Developers with `glslangValidator` can regenerate it after editing
+the shader with:
+
+```sh
+cmake --build build --target regenerate_vulkan_shader
 ```
 
 Sweep lists form a Cartesian product. `--sweep-sizes` uses square images;
@@ -73,16 +85,17 @@ against every edge.
 
 The program prints median, best, and p90 timings, speedups relative to scalar
 CPU, synchronized GPU dispatch and dispatch-plus-readback times, and correctness
-differences. A synchronized dispatch includes command submission and
-`glFinish()` overhead; this deliberately conservative measurement avoids
-unreliable timer-query results on some Mesa drivers. Warm-ups, shader
-compilation, context creation, buffer allocation, CSV writing, and image writing
-are outside timed regions.
+differences. A synchronized OpenGL dispatch includes command submission and
+`glFinish()` overhead. Vulkan additionally reports device timestamps around the
+compute dispatch, plus independently measured queue-submit/fence and readback
+durations. Warm-ups, pipeline/shader compilation, context/device creation,
+buffer allocation, CSV writing, and image writing are outside timed regions.
 
-CSV schema version 2 contains host, OS, CPU, compiler, build type, OpenGL
+CSV schema version 3 contains host, OS, CPU, compiler, build type, API,
 vendor/renderer, driver version, hardware/software classification, subgroup
-information, flattening mode and tolerance, full workload configuration, timing
-statistics, throughput, speedup, and correctness data. Use
+size and operation flags, timestamp precision, flattening mode and tolerance,
+full workload configuration, timing statistics, throughput, speedup, and
+correctness data. Use
 `--require-hardware-gpu` on a benchmark machine to reject llvmpipe, softpipe,
 SwiftShader, and other known software renderers. Without that option, software
 GPU rows are retained but marked `gpu_hardware=0`.

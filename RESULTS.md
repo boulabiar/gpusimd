@@ -141,6 +141,36 @@ pixel-scale tolerance. CPU scalar, AVX2, and threaded AVX2 outputs remained
 byte-identical in all three checks.
 
 Historical cross-hardware numbers above remain valid fixed-complexity results;
-their commands explicitly pass `--curve-segments 12`. New CSV schema version 2
+their commands explicitly pass `--curve-segments 12`. New CSV schema version 3
 records `flattening_mode`, `curve_segments`, and `flatness_pixels` to prevent
 mixing fixed and adaptive workloads in later comparisons.
+
+## Vulkan backend validation
+
+The optional Vulkan 1.2 compute backend was validated with the fixed 72-edge,
+4x4-AA scene at 256x256. It uses checked-in SPIR-V, discovers subgroup and
+timestamp capabilities through the Vulkan driver, and records device timestamp,
+synchronized queue submission, and readback as separate scopes.
+
+| Device and variant | Device timestamp | Submit + fence |
+|---|---:|---:|
+| Intel UHD 620, distributed | 8.423 ms | 8.735 ms |
+| Intel UHD 620, packed8 | 11.029 ms | 12.171 ms |
+| Radeon 8060S, distributed | 0.199 ms | 0.235 ms |
+| Radeon 8060S, packed8 | 0.469 ms | 0.545 ms |
+
+The Intel driver reports a 32-lane subgroup with 36 valid timestamp bits. The
+Radeon driver reports 64 lanes with 64 valid timestamp bits. Both advertise
+basic, vote, arithmetic, ballot, shuffle, shuffle-relative, clustered, and quad
+operations in compute shaders. Both Vulkan output variants matched the CPU
+reference byte-for-byte.
+
+At this workload, distributed invocation timestamps were 24% below packed8 on
+the Intel GPU and 58% below packed8 on the Radeon GPU. These pipelines still do
+not execute cross-lane instructions; capability discovery and reliable timing
+are now in place for the analytic prefix-scan experiment that will use them.
+
+Raw schema-v3 data is stored in `results/current-intel-vulkan.csv` and
+`results/amd-radeon-8060s-vulkan.csv`. Sub-millisecond host timings can be noisy,
+so device timestamps are the primary kernel measurement and synchronized/readback
+times describe application-visible boundaries.

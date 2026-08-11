@@ -18,7 +18,7 @@ endif()
 
 file(READ "${CSV_PATH}" csv)
 set(expected_header
-  "schema_version,timestamp_utc,hostname,os,cpu,cpu_logical_threads,compiler,build_type,api,gpu_vendor,gpu_renderer,gpu_version,gpu_hardware,subgroup_size,workgroup_size,width,height,aa_grid,flattening_mode,curve_segments,flatness_pixels,shape_count,edge_count,requested_cpu_threads,cpu_threads_used,warmup,iterations,backend,timing_scope,median_ms,minimum_ms,p90_ms,megapixels_per_second,speedup_vs_scalar,differing_pixels,max_channel_error,mean_absolute_channel_error")
+  "schema_version,timestamp_utc,hostname,os,cpu,cpu_logical_threads,compiler,build_type,api,gpu_vendor,gpu_renderer,gpu_version,gpu_hardware,subgroup_size,subgroup_operations,workgroup_size,timestamp_valid_bits,width,height,aa_grid,flattening_mode,curve_segments,flatness_pixels,shape_count,edge_count,requested_cpu_threads,cpu_threads_used,warmup,iterations,backend,timing_scope,median_ms,minimum_ms,p90_ms,megapixels_per_second,speedup_vs_scalar,differing_pixels,max_channel_error,mean_absolute_channel_error")
 string(FIND "${csv}" "${expected_header}\n" header_position)
 if(NOT header_position EQUAL 0)
   message(FATAL_ERROR "CSV header does not match schema")
@@ -36,7 +36,7 @@ foreach(backend IN ITEMS cpu_scalar cpu_avx2 cpu_avx2_threaded)
   endif()
 endforeach()
 
-string(REGEX MATCHALL "\n2,[^\n]+" result_rows "${csv}")
+string(REGEX MATCHALL "\n3,[^\n]+" result_rows "${csv}")
 list(LENGTH result_rows result_count)
 if(NOT result_count EQUAL 3)
   message(FATAL_ERROR "expected 3 CPU result rows, found ${result_count}")

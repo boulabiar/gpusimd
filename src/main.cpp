@@ -2,6 +2,10 @@
 
 #include "lane_program.h"
 
+#if defined(GPUSIMD_HAS_VULKAN)
+#include "vulkan_renderer.h"
+#endif
+
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GL/gl.h>
@@ -62,6 +66,8 @@ struct Options {
   std::vector<uint32_t> sweepCurveSegments;
   std::vector<uint32_t> sweepShapeCounts;
   bool gpu = true;
+  bool openGl = true;
+  bool vulkan = false;
   bool writeImages = true;
   bool requireHardwareGpu = false;
 };
@@ -117,6 +123,8 @@ struct GpuInfo {
   bool hardware = false;
   uint32_t subgroupSize = 0;
   uint32_t workgroupSize = 0;
+  std::string subgroupOperations;
+  uint32_t timestampValidBits = 0;
 };
 
 struct ResultRow {
@@ -198,6 +206,8 @@ Options parseOptions(int argc, char** argv) {
     else if (arg == "--output-dir") options.outputDir = takeValue("--output-dir");
     else if (arg == "--csv") options.csvPath = takeValue("--csv");
     else if (arg == "--no-gpu") options.gpu = false;
+    else if (arg == "--vulkan") options.vulkan = true;
+    else if (arg == "--no-opengl") options.openGl = false;
     else if (arg == "--no-images") options.writeImages = false;
     else if (arg == "--require-hardware-gpu") options.requireHardwareGpu = true;
     else if (arg == "--help") {
@@ -220,7 +230,9 @@ Options parseOptions(int argc, char** argv) {
         << "  --output-dir PATH  PPM output directory (default output)\n"
         << "  --no-images        do not write PPM images\n"
         << "  --no-gpu           run only CPU implementations\n"
-        << "  --require-hardware-gpu  fail if the OpenGL renderer is software\n";
+        << "  --vulkan          also run the optional Vulkan compute backend\n"
+        << "  --no-opengl       skip OpenGL (use with --vulkan for Vulkan-only)\n"
+        << "  --require-hardware-gpu  fail if a selected GPU backend is software\n";
       std::exit(0);
     }
     else {
@@ -669,7 +681,8 @@ void writeCsv(
 
   stream
     << "schema_version,timestamp_utc,hostname,os,cpu,cpu_logical_threads,compiler,build_type,"
-       "api,gpu_vendor,gpu_renderer,gpu_version,gpu_hardware,subgroup_size,workgroup_size,"
+       "api,gpu_vendor,gpu_renderer,gpu_version,gpu_hardware,subgroup_size,subgroup_operations,"
+       "workgroup_size,timestamp_valid_bits,"
        "width,height,aa_grid,flattening_mode,curve_segments,flatness_pixels,shape_count,edge_count,"
        "requested_cpu_threads,cpu_threads_used,warmup,iterations,"
        "backend,timing_scope,median_ms,minimum_ms,p90_ms,megapixels_per_second,speedup_vs_scalar,"
@@ -682,7 +695,7 @@ void writeCsv(
       double(uint64_t(row.configuration.width) * row.configuration.height) /
       (row.timing.medianMs * 1000.0);
     stream
-      << "2," << csvEscape(host.timestampUtc)
+      << "3," << csvEscape(host.timestampUtc)
       << ',' << csvEscape(host.hostname)
       << ',' << csvEscape(host.os)
       << ',' << csvEscape(host.cpu)
@@ -695,7 +708,9 @@ void writeCsv(
       << ',' << (gpu ? csvEscape(row.gpu.version) : "")
       << ',' << (gpu ? (row.gpu.hardware ? "1" : "0") : "")
       << ',' << (gpu && row.gpu.subgroupSize ? std::to_string(row.gpu.subgroupSize) : "")
+      << ',' << (gpu ? csvEscape(row.gpu.subgroupOperations) : "")
       << ',' << (gpu ? std::to_string(row.gpu.workgroupSize) : "")
+      << ',' << (gpu && row.gpu.timestampValidBits ? std::to_string(row.gpu.timestampValidBits) : "")
       << ',' << row.configuration.width
       << ',' << row.configuration.height
       << ',' << row.configuration.aaGrid
@@ -960,7 +975,8 @@ public:
   }
 
   GpuInfo info() const {
-    return GpuInfo{vendor_, renderer_, version_, hardware_, subgroupSize_, workgroupSize_};
+    return GpuInfo{
+      vendor_, renderer_, version_, hardware_, subgroupSize_, workgroupSize_, "", 0};
   }
 
   Result run(uint32_t pixelsPerInvocation, uint32_t warmup, uint32_t iterations) {
@@ -1055,7 +1071,7 @@ void printTiming(const char* name, const Timing& timing, double baselineMs) {
 }
 
 void printComparison(const char* name, const Comparison& comparison, size_t pixelCount) {
-  std::cout << "  correctness " << std::left << std::setw(18) << name
+  std::cout << "  correctness " << std::left << std::setw(22) << name
             << comparison.differingPixels << '/' << pixelCount << " pixels differ, max channel error "
             << comparison.maxChannelError << ", mean abs channel error "
             << std::fixed << std::setprecision(6) << comparison.meanAbsoluteChannelError << '\n';
@@ -1069,10 +1085,18 @@ int main(int argc, char** argv) {
     const HostInfo host = queryHostInfo();
     const std::vector<Configuration> configurations = makeConfigurations(options);
     std::vector<ResultRow> rows;
-    rows.reserve(configurations.size() * (options.gpu ? 7u : 3u));
+    const size_t rowsPerConfiguration = 3u +
+      (options.gpu && options.openGl ? 4u : 0u) +
+      (options.gpu && options.vulkan ? 6u : 0u);
+    rows.reserve(configurations.size() * rowsPerConfiguration);
+
+#if !defined(GPUSIMD_HAS_VULKAN)
+    if (options.gpu && options.vulkan)
+      fail("--vulkan requested, but this build has no Vulkan loader/headers");
+#endif
 
     std::unique_ptr<EglContext> context;
-    if (options.gpu)
+    if (options.gpu && options.openGl)
       context = std::make_unique<EglContext>();
 
     std::cout << "GPU-distributed SIMD vector rasterization experiment\n"
@@ -1082,7 +1106,10 @@ int main(int argc, char** argv) {
               << " | warm-up: " << options.warmup
               << " | measured iterations: " << options.iterations << "\n";
 
-    bool printedGpuInfo = false;
+    bool printedOpenGlInfo = false;
+#if defined(GPUSIMD_HAS_VULKAN)
+    bool printedVulkanInfo = false;
+#endif
     for (size_t configurationIndex = 0; configurationIndex < configurations.size(); ++configurationIndex) {
       const Configuration config = configurations[configurationIndex];
       const std::vector<Edge> edges = makeScene(
@@ -1139,10 +1166,10 @@ int main(int argc, char** argv) {
         writePpm(imageDirectory / "avx2.ppm", config.width, config.height, simdPixels);
       }
 
-      if (options.gpu) {
+      if (options.gpu && options.openGl) {
         GpuRenderer gpu(config.width, config.height, config.aaGrid, edges);
         const GpuInfo gpuInfo = gpu.info();
-        if (!printedGpuInfo) {
+        if (!printedOpenGlInfo) {
           std::cout << "\nOpenGL vendor:   " << gpuInfo.vendor
                     << "\nOpenGL renderer: " << gpuInfo.renderer
                     << "\nOpenGL version:  " << gpuInfo.version << '\n';
@@ -1154,7 +1181,7 @@ int main(int argc, char** argv) {
           if (!gpuInfo.hardware)
             std::cout << "WARNING: software OpenGL renderer detected; GPU rows are tagged gpu_hardware=0 "
                          "and are not hardware evidence.\n";
-          printedGpuInfo = true;
+          printedOpenGlInfo = true;
         }
         if (options.requireHardwareGpu && !gpuInfo.hardware)
           fail("--require-hardware-gpu rejected software renderer: " + gpuInfo.renderer);
@@ -1164,12 +1191,12 @@ int main(int argc, char** argv) {
         const Comparison distributedComparison = compareImages(scalarPixels, distributed.pixels);
         const Comparison packedComparison = compareImages(scalarPixels, packed.pixels);
 
-        printTiming("GPU distributed + sync", distributed.kernel, scalarTiming.medianMs);
-        printTiming("GPU packed8 + sync", packed.kernel, scalarTiming.medianMs);
-        printTiming("GPU distributed + readback", distributed.withReadback, scalarTiming.medianMs);
-        printTiming("GPU packed + readback", packed.withReadback, scalarTiming.medianMs);
-        printComparison("GPU distributed", distributedComparison, pixelCount);
-        printComparison("GPU packed", packedComparison, pixelCount);
+        printTiming("OpenGL distributed + sync", distributed.kernel, scalarTiming.medianMs);
+        printTiming("OpenGL packed8 + sync", packed.kernel, scalarTiming.medianMs);
+        printTiming("OpenGL distributed + read", distributed.withReadback, scalarTiming.medianMs);
+        printTiming("OpenGL packed + readback", packed.withReadback, scalarTiming.medianMs);
+        printComparison("OpenGL distributed", distributedComparison, pixelCount);
+        printComparison("OpenGL packed", packedComparison, pixelCount);
 
         rows.push_back(ResultRow{config, uint32_t(edges.size()), 0u, "gpu_distributed", "opengl",
                                  "synchronized_dispatch", distributed.kernel,
@@ -1193,6 +1220,79 @@ int main(int argc, char** argv) {
           writePpm(imageDirectory / "gpu_packed8.ppm", config.width, config.height, packed.pixels);
         }
       }
+
+#if defined(GPUSIMD_HAS_VULKAN)
+      if (options.gpu && options.vulkan) {
+        gpusimd::VulkanRenderer renderer(
+          config.width, config.height, config.aaGrid, edges);
+        const gpusimd::VulkanDeviceInfo& device = renderer.deviceInfo();
+        const GpuInfo gpuInfo{
+          device.vendor,
+          device.device,
+          "Vulkan " + device.apiVersion + " | " + device.driver,
+          device.hardware,
+          device.subgroupSize,
+          device.workgroupSize,
+          device.subgroupOperations,
+          device.timestampValidBits
+        };
+        if (!printedVulkanInfo) {
+          std::cout << "\nVulkan vendor:   " << device.vendor
+                    << "\nVulkan device:   " << device.device
+                    << "\nVulkan API:      " << device.apiVersion
+                    << "\nVulkan driver:   " << device.driver
+                    << "\nVulkan subgroup: " << device.subgroupSize << " lanes; "
+                    << device.subgroupOperations
+                    << "\nTimestamp bits:  " << device.timestampValidBits << '\n';
+          if (!device.hardware)
+            std::cout << "WARNING: software Vulkan device detected; rows are tagged gpu_hardware=0 "
+                         "and are not hardware evidence.\n";
+          printedVulkanInfo = true;
+        }
+        if (options.requireHardwareGpu && !device.hardware)
+          fail("--require-hardware-gpu rejected software Vulkan device: " + device.device);
+
+        auto distributed = renderer.run(1, options.warmup, options.iterations);
+        auto packed = renderer.run(8, options.warmup, options.iterations);
+        const Timing distributedTimestamp = summarizeSamples(std::move(distributed.timestampMilliseconds));
+        const Timing distributedSync = summarizeSamples(std::move(distributed.synchronizedMilliseconds));
+        const Timing distributedReadback = summarizeSamples(std::move(distributed.readbackMilliseconds));
+        const Timing packedTimestamp = summarizeSamples(std::move(packed.timestampMilliseconds));
+        const Timing packedSync = summarizeSamples(std::move(packed.synchronizedMilliseconds));
+        const Timing packedReadback = summarizeSamples(std::move(packed.readbackMilliseconds));
+        const Comparison distributedComparison = compareImages(scalarPixels, distributed.pixels);
+        const Comparison packedComparison = compareImages(scalarPixels, packed.pixels);
+
+        printTiming("Vulkan distributed timestamp", distributedTimestamp, scalarTiming.medianMs);
+        printTiming("Vulkan packed8 timestamp", packedTimestamp, scalarTiming.medianMs);
+        printTiming("Vulkan distributed + sync", distributedSync, scalarTiming.medianMs);
+        printTiming("Vulkan packed8 + sync", packedSync, scalarTiming.medianMs);
+        printTiming("Vulkan distributed + read", distributedReadback, scalarTiming.medianMs);
+        printTiming("Vulkan packed8 + readback", packedReadback, scalarTiming.medianMs);
+        printComparison("Vulkan distributed", distributedComparison, pixelCount);
+        printComparison("Vulkan packed", packedComparison, pixelCount);
+
+        const auto addRow = [&](const char* backend, const char* scope,
+                                const Timing& timing, const Comparison& comparison) {
+          rows.push_back(ResultRow{
+            config, uint32_t(edges.size()), 0u, backend, "vulkan", scope, timing,
+            scalarTiming.medianMs / timing.medianMs, comparison, gpuInfo});
+        };
+        addRow("gpu_distributed", "device_timestamp", distributedTimestamp, distributedComparison);
+        addRow("gpu_packed8", "device_timestamp", packedTimestamp, packedComparison);
+        addRow("gpu_distributed", "synchronized_dispatch", distributedSync, distributedComparison);
+        addRow("gpu_packed8", "synchronized_dispatch", packedSync, packedComparison);
+        addRow("gpu_distributed", "dispatch_plus_readback", distributedReadback, distributedComparison);
+        addRow("gpu_packed8", "dispatch_plus_readback", packedReadback, packedComparison);
+
+        if (options.writeImages) {
+          writePpm(imageDirectory / "vulkan_distributed.ppm",
+                   config.width, config.height, distributed.pixels);
+          writePpm(imageDirectory / "vulkan_packed8.ppm",
+                   config.width, config.height, packed.pixels);
+        }
+      }
+#endif
     }
 
     if (!options.csvPath.empty()) {

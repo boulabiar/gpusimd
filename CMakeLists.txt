@@ -9,6 +9,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(Threads REQUIRED)
 find_package(OpenGL REQUIRED COMPONENTS OpenGL EGL)
 
+option(GPUSIMD_ENABLE_VULKAN "Build the optional Vulkan compute backend" ON)
+if(GPUSIMD_ENABLE_VULKAN)
+  find_package(Vulkan QUIET)
+endif()
+
 add_executable(gpusimd_vector_bench
   src/main.cpp
 )
@@ -18,6 +23,33 @@ target_link_libraries(gpusimd_vector_bench PRIVATE
   OpenGL::OpenGL
   OpenGL::EGL
 )
+
+if(Vulkan_FOUND)
+  target_sources(gpusimd_vector_bench PRIVATE
+    src/vulkan_renderer.cpp
+    src/vulkan_renderer.h
+    src/vulkan_shader.comp
+    src/vulkan_shader_spv.h
+  )
+  target_link_libraries(gpusimd_vector_bench PRIVATE Vulkan::Vulkan)
+  target_compile_definitions(gpusimd_vector_bench PRIVATE GPUSIMD_HAS_VULKAN=1)
+  message(STATUS "Vulkan compute backend enabled")
+
+  find_program(GPUSIMD_GLSLANG_VALIDATOR glslangValidator)
+  if(GPUSIMD_GLSLANG_VALIDATOR)
+    add_custom_target(regenerate_vulkan_shader
+      COMMAND ${GPUSIMD_GLSLANG_VALIDATOR}
+        -V --target-env vulkan1.2
+        --vn gpusimdVulkanShaderSpv
+        -o ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_shader_spv.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_shader.comp
+      COMMENT "Regenerating embedded Vulkan SPIR-V"
+      VERBATIM
+    )
+  endif()
+elseif(GPUSIMD_ENABLE_VULKAN)
+  message(STATUS "Vulkan loader/headers not found; Vulkan backend disabled")
+endif()
 
 target_compile_options(gpusimd_vector_bench PRIVATE
   -O3
