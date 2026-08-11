@@ -52,7 +52,8 @@ struct Options {
   uint32_t warmup = 1;
   uint32_t iterations = 5;
   uint32_t threads = std::max(1u, std::thread::hardware_concurrency());
-  uint32_t curveSegments = 12;
+  uint32_t curveSegments = 0;
+  float flatness = 0.25f;
   uint32_t shapeCount = 1;
   std::filesystem::path outputDir = "output";
   std::filesystem::path csvPath;
@@ -71,6 +72,7 @@ struct Configuration {
   uint32_t aaGrid;
   uint32_t threads;
   uint32_t curveSegments;
+  float flatness;
   uint32_t shapeCount;
 };
 
@@ -135,11 +137,21 @@ struct ResultRow {
 }
 
 uint32_t parseU32(std::string_view value, const char* option) {
+  const std::string ownedValue(value);
   char* end = nullptr;
-  const unsigned long parsed = std::strtoul(std::string(value).c_str(), &end, 10);
+  const unsigned long parsed = std::strtoul(ownedValue.c_str(), &end, 10);
   if (!end || *end != '\0' || parsed == 0 || parsed > std::numeric_limits<uint32_t>::max())
     fail(std::string("invalid value for ") + option + ": " + std::string(value));
   return uint32_t(parsed);
+}
+
+float parsePositiveFloat(std::string_view value, const char* option) {
+  const std::string ownedValue(value);
+  char* end = nullptr;
+  const float parsed = std::strtof(ownedValue.c_str(), &end);
+  if (!end || *end != '\0' || !std::isfinite(parsed) || parsed <= 0.0f)
+    fail(std::string("invalid value for ") + option + ": " + std::string(value));
+  return parsed;
 }
 
 std::vector<uint32_t> parseU32List(std::string_view value, const char* option) {
@@ -177,6 +189,7 @@ Options parseOptions(int argc, char** argv) {
     else if (arg == "--iterations") options.iterations = parseU32(takeValue("--iterations"), "--iterations");
     else if (arg == "--threads") options.threads = parseU32(takeValue("--threads"), "--threads");
     else if (arg == "--curve-segments") options.curveSegments = parseU32(takeValue("--curve-segments"), "--curve-segments");
+    else if (arg == "--flatness") options.flatness = parsePositiveFloat(takeValue("--flatness"), "--flatness");
     else if (arg == "--shapes") options.shapeCount = parseU32(takeValue("--shapes"), "--shapes");
     else if (arg == "--sweep-sizes") options.sweepSizes = parseU32List(takeValue("--sweep-sizes"), "--sweep-sizes");
     else if (arg == "--sweep-threads") options.sweepThreads = parseU32List(takeValue("--sweep-threads"), "--sweep-threads");
@@ -196,7 +209,8 @@ Options parseOptions(int argc, char** argv) {
         << "  --warmup N         untimed warm-up iterations (default 1)\n"
         << "  --iterations N     measured iterations (default 5)\n"
         << "  --threads N        CPU worker count (default hardware concurrency)\n"
-        << "  --curve-segments N segments per cubic; total edges/shape is about 6N (default 12)\n"
+        << "  --flatness F       adaptive curve error in pixels (default 0.25)\n"
+        << "  --curve-segments N use fixed subdivision; about 6N edges/shape\n"
         << "  --shapes N         independent heart shapes in the scene (default 1)\n"
         << "  --sweep-sizes LIST comma-separated square image sizes\n"
         << "  --sweep-threads LIST comma-separated CPU worker counts\n"
@@ -216,6 +230,8 @@ Options parseOptions(int argc, char** argv) {
 
   if (options.aaGrid > 8)
     fail("--aa must be between 1 and 8");
+  if (options.flatness < 0.001f)
+    fail("--flatness must be at least 0.001 pixel");
   return options;
 }
 
@@ -237,7 +253,7 @@ void addLineEdge(std::vector<Edge>& edges, Point a, Point b) {
   edges.push_back(Edge{a.x, a.y, b.y, (b.x - a.x) / (b.y - a.y)});
 }
 
-void flattenCubic(std::vector<Edge>& edges, const Cubic& cubic, uint32_t segments) {
+void flattenCubicFixed(std::vector<Edge>& edges, const Cubic& cubic, uint32_t segments) {
   Point previous = cubic.p0;
   for (uint32_t i = 1; i <= segments; ++i) {
     const Point current = cubicPoint(cubic, float(i) / float(segments));
@@ -246,12 +262,77 @@ void flattenCubic(std::vector<Edge>& edges, const Cubic& cubic, uint32_t segment
   }
 }
 
+Point midpoint(Point a, Point b) {
+  return Point{(a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f};
+}
+
+float distance(Point a, Point b) {
+  return std::hypot(a.x - b.x, a.y - b.y);
+}
+
+float distanceToLine(Point point, Point lineStart, Point lineEnd) {
+  const float dx = lineEnd.x - lineStart.x;
+  const float dy = lineEnd.y - lineStart.y;
+  const float chordLength = std::hypot(dx, dy);
+  if (chordLength < 1e-7f)
+    return distance(point, lineStart);
+  return std::abs((point.x - lineStart.x) * dy - (point.y - lineStart.y) * dx) /
+         chordLength;
+}
+
+bool cubicIsFlatEnough(const Cubic& cubic, float flatness) {
+  const float controlDistance = std::max(
+    distanceToLine(cubic.p1, cubic.p0, cubic.p3),
+    distanceToLine(cubic.p2, cubic.p0, cubic.p3));
+  const float chordLength = distance(cubic.p0, cubic.p3);
+  const float controlPolygonLength =
+    distance(cubic.p0, cubic.p1) + distance(cubic.p1, cubic.p2) + distance(cubic.p2, cubic.p3);
+  return controlDistance <= flatness && controlPolygonLength - chordLength <= flatness * 2.0f;
+}
+
+void flattenCubicAdaptive(
+  std::vector<Edge>& edges,
+  const Cubic& cubic,
+  float flatness,
+  uint32_t depth = 0) {
+
+  constexpr uint32_t maxDepth = 24;
+  if (depth == maxDepth || cubicIsFlatEnough(cubic, flatness)) {
+    addLineEdge(edges, cubic.p0, cubic.p3);
+    return;
+  }
+
+  // de Casteljau subdivision at t=0.5 preserves the exact cubic geometry.
+  const Point p01 = midpoint(cubic.p0, cubic.p1);
+  const Point p12 = midpoint(cubic.p1, cubic.p2);
+  const Point p23 = midpoint(cubic.p2, cubic.p3);
+  const Point p012 = midpoint(p01, p12);
+  const Point p123 = midpoint(p12, p23);
+  const Point center = midpoint(p012, p123);
+  flattenCubicAdaptive(edges, Cubic{cubic.p0, p01, p012, center}, flatness, depth + 1u);
+  flattenCubicAdaptive(edges, Cubic{center, p123, p23, cubic.p3}, flatness, depth + 1u);
+}
+
+uint32_t adaptiveCircleSegments(float radius, float flatness) {
+  if (flatness >= radius)
+    return 8u;
+  const double cosine = std::clamp(1.0 - double(flatness / radius), -1.0, 1.0);
+  const double halfAngle = std::acos(cosine);
+  if (halfAngle <= 0.0)
+    fail("adaptive circle tolerance is too small");
+  const double segmentCount = std::ceil(double(M_PI) / halfAngle);
+  if (segmentCount > double(std::numeric_limits<uint32_t>::max()))
+    fail("adaptive circle requires too many segments");
+  return std::max(8u, uint32_t(segmentCount));
+}
+
 void addHeart(
   std::vector<Edge>& edges,
   float cx,
   float cy,
   float scale,
-  uint32_t curveSegments) {
+  uint32_t curveSegments,
+  float flatness) {
 
   const auto map = [&](Point p) -> Point {
     return Point{cx + p.x * scale, cy + p.y * scale};
@@ -266,11 +347,17 @@ void addHeart(
     {map({ 0.94f,  0.32f}), map({ 1.22f, -0.32f}), map({ 0.52f, -0.94f}), map({ 0.00f, -0.32f})}
   }};
 
-  for (const Cubic& cubic : heart)
-    flattenCubic(edges, cubic, curveSegments);
+  for (const Cubic& cubic : heart) {
+    if (curveSegments)
+      flattenCubicFixed(edges, cubic, curveSegments);
+    else
+      flattenCubicAdaptive(edges, cubic, flatness);
+  }
 
   // A reversed circular subpath makes a hole under the even-odd fill rule.
-  const uint32_t holeSegments = std::max(8u, curveSegments * 2u);
+  const uint32_t holeSegments = curveSegments
+    ? std::max(8u, curveSegments * 2u)
+    : adaptiveCircleSegments(scale * 0.20f, flatness);
   Point previous{};
   for (uint32_t i = 0; i <= holeSegments; ++i) {
     const float angle = -2.0f * float(M_PI) * float(i) / float(holeSegments);
@@ -286,20 +373,22 @@ std::vector<Edge> makeScene(
   uint32_t width,
   uint32_t height,
   uint32_t curveSegments,
+  float flatness,
   uint32_t shapeCount) {
 
-  const uint64_t holeSegments = std::max(uint64_t(8), uint64_t(curveSegments) * 2u);
-  const uint64_t edgesPerShape = uint64_t(curveSegments) * 4u + holeSegments;
-  if (uint64_t(shapeCount) * edgesPerShape > std::numeric_limits<uint32_t>::max())
+  const uint64_t estimatedEdgesPerShape = curveSegments
+    ? uint64_t(curveSegments) * 4u + std::max(uint64_t(8), uint64_t(curveSegments) * 2u)
+    : 128u;
+  if (uint64_t(shapeCount) * estimatedEdgesPerShape > std::numeric_limits<uint32_t>::max())
     fail("requested scene has too many edges");
 
   std::vector<Edge> edges;
-  edges.reserve(size_t(uint64_t(shapeCount) * edgesPerShape));
+  edges.reserve(size_t(uint64_t(shapeCount) * estimatedEdgesPerShape));
 
   if (shapeCount == 1) {
     // Preserve the original baseline geometry exactly.
     const float scale = 0.36f * float(std::min(width, height));
-    addHeart(edges, 0.50f * float(width), 0.45f * float(height), scale, curveSegments);
+    addHeart(edges, 0.50f * float(width), 0.45f * float(height), scale, curveSegments, flatness);
     return edges;
   }
 
@@ -313,7 +402,7 @@ std::vector<Edge> makeScene(
     const uint32_t row = i / columns;
     const float cx = (float(column) + 0.50f) * cellWidth;
     const float cy = (float(row) + 0.45f) * cellHeight;
-    addHeart(edges, cx, cy, scale, curveSegments);
+    addHeart(edges, cx, cy, scale, curveSegments, flatness);
   }
   return edges;
 }
@@ -535,7 +624,8 @@ std::vector<Configuration> makeConfigurations(const Options& options) {
     for (uint32_t threadCount : threads) {
       for (uint32_t segments : curveSegments) {
         for (uint32_t shapes : shapeCounts)
-          configurations.push_back(Configuration{width, height, options.aaGrid, threadCount, segments, shapes});
+          configurations.push_back(Configuration{
+            width, height, options.aaGrid, threadCount, segments, options.flatness, shapes});
       }
     }
   }
@@ -546,7 +636,7 @@ std::string configurationTag(const Configuration& config) {
   std::ostringstream stream;
   stream << config.width << 'x' << config.height
          << "_aa" << config.aaGrid
-         << "_seg" << config.curveSegments
+         << (config.curveSegments ? "_fixed" + std::to_string(config.curveSegments) : "_adaptive")
          << "_shapes" << config.shapeCount
          << "_t" << config.threads;
   return stream.str();
@@ -580,7 +670,8 @@ void writeCsv(
   stream
     << "schema_version,timestamp_utc,hostname,os,cpu,cpu_logical_threads,compiler,build_type,"
        "api,gpu_vendor,gpu_renderer,gpu_version,gpu_hardware,subgroup_size,workgroup_size,"
-       "width,height,aa_grid,curve_segments,shape_count,edge_count,requested_cpu_threads,cpu_threads_used,warmup,iterations,"
+       "width,height,aa_grid,flattening_mode,curve_segments,flatness_pixels,shape_count,edge_count,"
+       "requested_cpu_threads,cpu_threads_used,warmup,iterations,"
        "backend,timing_scope,median_ms,minimum_ms,p90_ms,megapixels_per_second,speedup_vs_scalar,"
        "differing_pixels,max_channel_error,mean_absolute_channel_error\n";
 
@@ -591,7 +682,7 @@ void writeCsv(
       double(uint64_t(row.configuration.width) * row.configuration.height) /
       (row.timing.medianMs * 1000.0);
     stream
-      << "1," << csvEscape(host.timestampUtc)
+      << "2," << csvEscape(host.timestampUtc)
       << ',' << csvEscape(host.hostname)
       << ',' << csvEscape(host.os)
       << ',' << csvEscape(host.cpu)
@@ -608,7 +699,9 @@ void writeCsv(
       << ',' << row.configuration.width
       << ',' << row.configuration.height
       << ',' << row.configuration.aaGrid
-      << ',' << row.configuration.curveSegments
+      << ',' << (row.configuration.curveSegments ? "fixed" : "adaptive")
+      << ',' << (row.configuration.curveSegments ? std::to_string(row.configuration.curveSegments) : "")
+      << ',' << (row.configuration.curveSegments ? "" : std::to_string(row.configuration.flatness))
       << ',' << row.configuration.shapeCount
       << ',' << row.edgeCount
       << ',' << row.configuration.threads
@@ -993,7 +1086,7 @@ int main(int argc, char** argv) {
     for (size_t configurationIndex = 0; configurationIndex < configurations.size(); ++configurationIndex) {
       const Configuration config = configurations[configurationIndex];
       const std::vector<Edge> edges = makeScene(
-        config.width, config.height, config.curveSegments, config.shapeCount);
+        config.width, config.height, config.curveSegments, config.flatness, config.shapeCount);
       const size_t pixelCount = size_t(config.width) * config.height;
       std::vector<uint32_t> scalarPixels(pixelCount);
       std::vector<uint32_t> simdPixels(pixelCount);
@@ -1002,6 +1095,10 @@ int main(int argc, char** argv) {
       std::cout << "\n[" << (configurationIndex + 1u) << '/' << configurations.size() << "] "
                 << config.width << 'x' << config.height
                 << ", AA " << config.aaGrid << 'x' << config.aaGrid
+                << ", flattening "
+                << (config.curveSegments
+                      ? "fixed " + std::to_string(config.curveSegments) + " segments/cubic"
+                      : "adaptive " + std::to_string(config.flatness) + " px")
                 << ", " << edges.size() << " edges in " << config.shapeCount
                 << " shape(s), " << config.threads << " requested CPU threads\n";
 

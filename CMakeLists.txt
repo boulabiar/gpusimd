@@ -36,10 +36,16 @@ target_compile_definitions(gpusimd_vector_bench PRIVATE
 include(CTest)
 if(BUILD_TESTING)
   add_test(
-    NAME cpu_correctness_smoke
+    NAME adaptive_cpu_correctness_smoke
     COMMAND gpusimd_vector_bench
       --width 64 --height 64 --aa 2 --iterations 1 --threads 2
       --no-gpu --no-images
+  )
+  add_test(
+    NAME fixed_cpu_correctness_smoke
+    COMMAND gpusimd_vector_bench
+      --width 64 --height 64 --aa 2 --iterations 1 --threads 2
+      --curve-segments 4 --no-gpu --no-images
   )
   add_test(
     NAME csv_schema_smoke

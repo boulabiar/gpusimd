@@ -126,3 +126,21 @@ prefix-scan milestone.
 
 Raw data is available as `results/amd-radeon-8060s-baseline.csv` on both
 machines.
+
+## Adaptive-flattening quality check
+
+The initial 72-edge benchmark uses an intentionally fixed subdivision of 12
+segments per cubic and 24 around the hole. This preserves a simple complexity
+baseline, but its facets are visible and become larger as resolution increases.
+
+Adaptive de Casteljau subdivision with a 0.25-pixel screen-space tolerance is
+now the default for visually representative rendering. It generated 104 edges
+at 256x256, 117 at 512x512, and 205 at 1024x1024 for the same heart. The edge
+count grows with the transformed curve size, keeping geometric error below the
+pixel-scale tolerance. CPU scalar, AVX2, and threaded AVX2 outputs remained
+byte-identical in all three checks.
+
+Historical cross-hardware numbers above remain valid fixed-complexity results;
+their commands explicitly pass `--curve-segments 12`. New CSV schema version 2
+records `flattening_mode`, `curve_segments`, and `flatness_pixels` to prevent
+mixing fixed and adaptive workloads in later comparisons.

@@ -44,6 +44,7 @@ cmake --build build -j
 Useful options:
 
 ```sh
+./build/gpusimd_vector_bench --flatness 0.25
 ./build/gpusimd_vector_bench --width 1024 --height 1024 --aa 4 \
   --warmup 3 --iterations 7 --no-images --csv results/baseline.csv
 ./build/gpusimd_vector_bench --sweep-sizes 256,512,1024 \
@@ -55,8 +56,17 @@ Useful options:
 
 Sweep lists form a Cartesian product. `--sweep-sizes` uses square images;
 `--width` and `--height` remain available for a single rectangular run.
-`--curve-segments N` changes geometric complexity: four cubic edges and the
-circular hole produce approximately `6N` flattened edges per shape.
+By default, cubic curves are recursively subdivided with de Casteljau's
+algorithm until their screen-space error is at most 0.25 pixels. The circular
+hole derives its segment count from the same tolerance. `--flatness F` changes
+that visual-quality threshold.
+
+`--curve-segments N` explicitly switches to fixed subdivision for synthetic
+complexity experiments and reproducible historical baselines: four cubic edges
+and the circular hole produce approximately `6N` flattened edges per shape.
+Fixed subdivision deliberately does not scale with resolution and can show
+visible facets at low segment counts.
+
 `--shapes N` places independent, non-overlapping hearts in a grid. Start with a
 small sweep because the scalar reference deliberately tests every sample
 against every edge.
@@ -69,12 +79,13 @@ unreliable timer-query results on some Mesa drivers. Warm-ups, shader
 compilation, context creation, buffer allocation, CSV writing, and image writing
 are outside timed regions.
 
-CSV output contains host, OS, CPU, compiler, build type, OpenGL vendor/renderer,
-driver version, hardware/software classification, subgroup information, full
-workload configuration, timing statistics, throughput, speedup, and correctness
-data. Use `--require-hardware-gpu` on a benchmark machine to reject llvmpipe,
-softpipe, SwiftShader, and other known software renderers. Without that option,
-software GPU rows are retained but marked `gpu_hardware=0`.
+CSV schema version 2 contains host, OS, CPU, compiler, build type, OpenGL
+vendor/renderer, driver version, hardware/software classification, subgroup
+information, flattening mode and tolerance, full workload configuration, timing
+statistics, throughput, speedup, and correctness data. Use
+`--require-hardware-gpu` on a benchmark machine to reject llvmpipe, softpipe,
+SwiftShader, and other known software renderers. Without that option, software
+GPU rows are retained but marked `gpu_hardware=0`.
 
 PPM images are written to `output/` unless `--no-images` is used. A multi-case
 sweep puts each configuration in a separately named subdirectory.
